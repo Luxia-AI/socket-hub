@@ -5,4 +5,3 @@ redis
 httpx
 pytest
 pytest-cov
-httpx

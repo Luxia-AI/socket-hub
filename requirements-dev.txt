@@ -6,3 +6,6 @@ bandit
 ruff
 black
 mypy
+isort 
+flake8
+pydocstyle
