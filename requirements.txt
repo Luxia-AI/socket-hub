@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-socketio[asyncio_client]
+aiokafka
+redis
+pydantic
