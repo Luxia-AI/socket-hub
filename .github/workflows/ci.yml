@@ -25,8 +25,8 @@ jobs:
       - name: Run Flake8
         run: flake8 .
 
-      - name: Run mypy
-        run: mypy
+      - name: Run Mypy
+        run: mypy --explicit-package-bases app
 
       - name: Run Bandit
         run: bandit -r . -x tests
