@@ -1,6 +1,8 @@
+-r requirements.txt
 pytest
 pytest-cov
-black
-ruff
+httpx
 bandit
-pre-commit
+ruff
+black
+mypy
