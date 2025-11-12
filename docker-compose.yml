@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  socket-hub:
+    build: .
+    container_name: socket-hub
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: uvicorn app.main:asgi_app --host 0.0.0.0 --port 8000 --reload
