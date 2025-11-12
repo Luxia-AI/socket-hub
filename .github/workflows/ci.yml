@@ -25,8 +25,8 @@ jobs:
       - name: Run Flake8
         run: flake8 .
 
-      - name: Run Mypy
-        run: mypy .
+      - name: Run mypy
+        run: mypy
 
       - name: Run Bandit
         run: bandit -r . -x tests
