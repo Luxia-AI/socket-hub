@@ -11,14 +11,14 @@ class RoomManager:
     ):
         self.redis_url = redis_url
         self.prefix = prefix
-        self.redis: Optional[Redis[str]] = None
+        self.redis: Optional[Redis] = None
 
-    async def connect(self):
+    async def connect(self) -> None:
         """Establish async connection to Redis"""
         self.redis = await from_url(self.redis_url, decode_responses=True)
         print("[Redis] Connected")
 
-    async def disconnect(self):
+    async def disconnect(self) -> None:
         """Close connection to Redis"""
         if self.redis:
             await self.redis.close()
@@ -28,7 +28,7 @@ class RoomManager:
         """Initialize a room queue"""
         assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
-        exists = await self.redis.exists(key)
+        exists: int = await self.redis.exists(key)
         if not exists:
             await self.redis.lpush(key, json.dumps({"init": True}))
             print(f"[Redis] Room {room_id} initialized")
@@ -39,14 +39,14 @@ class RoomManager:
         assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
         await self.redis.rpush(key, json.dumps(post))
-        length = await self.redis.llen(key)
+        length: int = await self.redis.llen(key)
         print(f"[Redis] Added post to room {room_id} (queue length: {length})")
 
     async def get_next_post(self, room_id: str) -> Optional[dict[str, Any]]:
         """Retrieve (and remove) next post"""
         assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
-        data = await self.redis.lpop(key)
+        data: Optional[str] = await self.redis.lpop(key)
         return json.loads(data) if data else None
 
     async def get_queue_size(self, room_id: str) -> int:
