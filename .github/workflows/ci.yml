@@ -17,22 +17,19 @@ jobs:
           python-version: 3.12
 
       - name: Install dependencies
-        run: pip install -r requirements.txt && pip install black isort flake8 mypy bandit pydocstyle pytest pytest-cov
+        run: pip install -r requirements-dev.txt
 
       - name: Run Black
         run: black --check .
-
-      - name: Run isort
-        run: isort --check-only .
 
       - name: Run Flake8
         run: flake8 .
 
       - name: Run Mypy
-        run: mypy .
+        run: mypy
 
       - name: Run Bandit
-        run: bandit -r . -x tests
+        run: bandit -r .
 
       - name: Run Pytest with coverage
         run: pytest --cov=app tests/
