@@ -1,4 +1,9 @@
--r requirements.txt
+fastapi
+uvicorn
+python-socketio
+requests
+redis
+aiohttp
 pytest
 pytest-cov
 httpx
@@ -9,3 +14,4 @@ mypy
 isort 
 flake8
 pydocstyle
+aiohttp
