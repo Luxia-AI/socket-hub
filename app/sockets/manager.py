@@ -4,7 +4,11 @@ from typing import Any
 
 
 class RoomManager:
-    def __init__(self, redis_url: str = "redis://localhost:6379", prefix: str = "room"):
+    def __init__(
+        self,
+        redis_url: str = "redis://localhost:6379",
+        prefix: str = "room",
+    ):
         self.redis_url = redis_url
         self.prefix = prefix
         self.redis = None
