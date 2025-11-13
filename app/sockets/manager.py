@@ -28,7 +28,7 @@ class RoomManager:
         """Initialize a room queue"""
         assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
-        exists: int = await self.redis.exists(key)
+        exists: int = await self.redis.exists(key)  # type: ignore[misc]
         if not exists:
             await self.redis.lpush(key, json.dumps({"init": True}))
             print(f"[Redis] Room {room_id} initialized")
@@ -38,18 +38,18 @@ class RoomManager:
         """Add a post to the room queue"""
         assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
-        await self.redis.rpush(key, json.dumps(post))
-        length: int = await self.redis.llen(key)
+        await self.redis.rpush(key, json.dumps(post))  # type: ignore[misc]
+        length: int = await self.redis.llen(key)  # type: ignore[misc]
         print(f"[Redis] Added post to room {room_id} (queue length: {length})")
 
     async def get_next_post(self, room_id: str) -> Optional[dict[str, Any]]:
         """Retrieve (and remove) next post"""
         assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
-        data: Optional[str] = await self.redis.lpop(key)
+        data: Optional[str] = await self.redis.lpop(key)  # type: ignore[misc]
         return json.loads(data) if data else None
 
     async def get_queue_size(self, room_id: str) -> int:
         assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
-        return await self.redis.llen(key)
+        return await self.redis.llen(key)  # type: ignore[misc]
