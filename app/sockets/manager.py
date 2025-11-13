@@ -1,6 +1,6 @@
 import json
-from redis.asyncio import from_url
-from typing import Any
+from redis.asyncio import Redis, from_url
+from typing import Any, Optional
 
 
 class RoomManager:
@@ -11,7 +11,7 @@ class RoomManager:
     ):
         self.redis_url = redis_url
         self.prefix = prefix
-        self.redis = None
+        self.redis: Optional[Redis[str]] = None
 
     async def connect(self):
         """Establish async connection to Redis"""
@@ -24,8 +24,9 @@ class RoomManager:
             await self.redis.close()
             print("[Redis] Disconnected")
 
-    async def create_room(self, room_id: str):
+    async def create_room(self, room_id: str) -> str:
         """Initialize a room queue"""
+        assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
         exists = await self.redis.exists(key)
         if not exists:
@@ -33,19 +34,22 @@ class RoomManager:
             print(f"[Redis] Room {room_id} initialized")
         return key
 
-    async def enqueue_post(self, room_id: str, post: dict[str, Any]):
+    async def enqueue_post(self, room_id: str, post: dict[str, Any]) -> None:
         """Add a post to the room queue"""
+        assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
         await self.redis.rpush(key, json.dumps(post))
         length = await self.redis.llen(key)
         print(f"[Redis] Added post to room {room_id} (queue length: {length})")
 
-    async def get_next_post(self, room_id: str):
+    async def get_next_post(self, room_id: str) -> Optional[dict[str, Any]]:
         """Retrieve (and remove) next post"""
+        assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
         data = await self.redis.lpop(key)
         return json.loads(data) if data else None
 
     async def get_queue_size(self, room_id: str) -> int:
+        assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
         return await self.redis.llen(key)
