@@ -1,6 +1,12 @@
--r requirements.txt
+fastapi
+uvicorn
+python-socketio
+requests
+redis
+aiohttp
 pytest
 pytest-cov
+pytest-asyncio
 httpx
 bandit
 ruff
@@ -9,3 +15,4 @@ mypy
 isort 
 flake8
 pydocstyle
+pytest-timeout

@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 import socketio
 
@@ -11,23 +13,23 @@ room_manager = RoomManager()
 # Socket.IO server
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
+
+# Lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await room_manager.connect()
+    yield
+    # Shutdown
+    await room_manager.disconnect()
+
+
 # FastAPI app
-app = FastAPI(title="Socket Hub Service")
+app = FastAPI(title="Socket Hub Service", lifespan=lifespan)
 app.include_router(router, prefix="/api")
 
-# Mount socket.io
+# Mount socket.io - this is the ASGI app that should be run
 asgi_app = socketio.ASGIApp(sio, app)
-
-
-# Connect Redis on startup
-@app.on_event("startup")
-async def startup_event():
-    await room_manager.connect()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await room_manager.disconnect()
 
 
 @app.get("/")
