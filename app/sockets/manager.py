@@ -30,7 +30,7 @@ class RoomManager:
         key = f"{self.prefix}:{room_id}"
         exists: int = await self.redis.exists(key)  # type: ignore[misc]
         if not exists:
-            await self.redis.lpush(key, json.dumps({"init": True}))
+            await self.redis.lpush(key, json.dumps({"init": True}))  # type: ignore[misc]
             print(f"[Redis] Room {room_id} initialized")
         return key
 
