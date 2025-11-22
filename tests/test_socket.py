@@ -1,6 +1,7 @@
+import asyncio
+
 import pytest
 import socketio
-import asyncio
 
 
 @pytest.mark.asyncio
@@ -13,6 +14,6 @@ async def test_socket():
         await asyncio.wait_for(sio.connect("http://127.0.0.1:8000"), timeout=5.0)
         assert sio.connected  # nosec
         await sio.disconnect()
-    except (asyncio.TimeoutError, ConnectionRefusedError, Exception) as e:
+    except (TimeoutError, ConnectionRefusedError, Exception) as e:
         # If server is not running or connection times out, skip the test
-        pytest.skip(f"Server not available: {type(e).__name__}: {str(e)}")
+        pytest.skip(f"Server not available: {type(e).__name__}: {e!s}")

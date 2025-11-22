@@ -1,4 +1,26 @@
 [flake8]
-ignore = E501
-max-line-length = 88
-exclude = .git,__pycache__,.venv,tests
+max-line-length = 100
+exclude = 
+    .git,
+    __pycache__,
+    .venv,
+    venv,
+    .env,
+    dist,
+    build,
+    .pytest_cache,
+    .mypy_cache,
+    .ruff_cache
+
+ignore = 
+    E203,
+    E501,
+    W503,
+    W504,
+    E231
+
+per-file-ignores =
+    __init__.py:F401,F403
+    tests/*:F841
+
+max-complexity = 10

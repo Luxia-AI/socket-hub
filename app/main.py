@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
 import socketio
+from fastapi import FastAPI
 
 # Import custom modules
 from app.api.routes import router
@@ -16,7 +16,7 @@ sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
 # Lifespan context manager
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_: FastAPI):
     # Startup
     await room_manager.connect()
     yield
@@ -39,7 +39,7 @@ async def root():
 
 # Socket event
 @sio.event
-async def connect(sid, environ):
+async def connect(sid, _):
     print(f"Client connected: {sid}")
 
 
