@@ -1,3 +1,9 @@
-[bandit]
-skips: B101
-exclude: tests
+# Bandit configuration file
+exclude_dirs:
+    - tests
+    - .venv
+    - venv
+    - build
+    - dist
+skips:
+    - B101 # assert_used - assertions are fine in tests

@@ -1,6 +1,7 @@
 import json
+from typing import Any
+
 from redis.asyncio import Redis, from_url
-from typing import Any, Optional
 
 
 class RoomManager:
@@ -11,7 +12,7 @@ class RoomManager:
     ):
         self.redis_url = redis_url
         self.prefix = prefix
-        self.redis: Optional[Redis] = None
+        self.redis: Redis | None = None
 
     async def connect(self) -> None:
         """Establish async connection to Redis"""
@@ -42,11 +43,11 @@ class RoomManager:
         length: int = await self.redis.llen(key)  # type: ignore[misc]
         print(f"[Redis] Added post to room {room_id} (queue length: {length})")
 
-    async def get_next_post(self, room_id: str) -> Optional[dict[str, Any]]:
+    async def get_next_post(self, room_id: str) -> dict[str, Any] | None:
         """Retrieve (and remove) next post"""
         assert self.redis is not None, "Redis not connected"  # nosec
         key = f"{self.prefix}:{room_id}"
-        data: Optional[str] = await self.redis.lpop(key)  # type: ignore[misc]
+        data: str | None = await self.redis.lpop(key)  # type: ignore[misc]
         return json.loads(data) if data else None
 
     async def get_queue_size(self, room_id: str) -> int:
