@@ -16,3 +16,4 @@ isort
 flake8
 pydocstyle
 pytest-timeout
+pre-commit
