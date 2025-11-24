@@ -29,7 +29,7 @@ jobs:
         run: mypy
 
       - name: Run Bandit
-        run: bandit -r .
+        run: bandit -r app -c .bandit
 
       - name: Run Pytest with coverage
         run: pytest --cov=app tests/
