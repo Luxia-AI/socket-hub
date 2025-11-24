@@ -60,6 +60,7 @@ class TestMainApplicationEndpoints:
         assert response.json() == {"status": "ok"}  # nosec
 
 
+@pytest.mark.redis
 class TestRoomManager:
     """Test RoomManager Redis integration"""
 
@@ -99,6 +100,7 @@ class TestRoomManager:
         assert queue_size >= 2  # init + new post  # nosec
 
 
+@pytest.mark.redis
 class TestSocketIOEvents:
     """Test Socket.IO event handlers"""
 
