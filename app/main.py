@@ -1,6 +1,7 @@
 # socket-hub/app/main.py
 import asyncio
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 
@@ -15,8 +16,9 @@ KAFKA_BOOTSTRAP = "kafka:9092"
 POSTS_TOPIC = "posts.inbound"
 RESULTS_TOPIC = "jobs.results"
 
-# Initialize RoomManager (Redis)
-room_manager = RoomManager()
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+room_manager = RoomManager(redis_url=REDIS_URL)
 
 # Socket.IO server
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
