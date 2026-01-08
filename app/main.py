@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from app.api.routes import router
 from app.sockets.manager import RoomManager
 
-KAFKA_BOOTSTRAP = "kafka:9092"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 POSTS_TOPIC = "posts.inbound"
 RESULTS_TOPIC = "jobs.results"
 
@@ -25,6 +25,7 @@ sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
 producer: AIOKafkaProducer = None
 consumer: AIOKafkaConsumer = None
+redis_log_client = None  # For subscribing to worker logs via Redis pub/sub
 
 
 # LIFESPAN EVENT: START/STOP
@@ -56,10 +57,14 @@ async def lifespan(_app: FastAPI):
     # async background listener
     task = asyncio.create_task(worker_results_listener())
 
+    # Redis log listener for worker logs
+    redis_log_task = asyncio.create_task(worker_logs_listener())
+
     yield
 
     # shutdown
     task.cancel()
+    redis_log_task.cancel()
     await consumer.stop()
     await producer.stop()
     await room_manager.disconnect()
@@ -91,7 +96,7 @@ async def disconnect(sid):
 async def join_room(sid, data):
     room_id = data.get("room_id")
     await sio.save_session(sid, {"room_id": room_id})
-    sio.enter_room(sid, room_id)
+    await sio.enter_room(sid, room_id)
     await room_manager.create_room(room_id)
     print(f"[Socket] {sid} joined room {room_id}")
 
@@ -140,3 +145,66 @@ async def worker_results_listener():
         await sio.emit("worker_update", result, room=post_id)
 
         print(f"[SocketHub] Emitted worker result for post {post_id}")
+
+
+# REDIS LOG SUBSCRIPTION -> EMIT TO SOCKET ROOMS
+async def worker_logs_listener():
+    """
+    This subscribes to worker logs via Redis pub/sub and forwards them
+    to the correct socket.io room.
+    """
+    global redis_log_client
+
+    print("[SocketHub] Worker logs listener starting...")
+
+    try:
+        import redis.asyncio as aioredis
+
+        redis_log_client = await aioredis.from_url(REDIS_URL)
+        pubsub = redis_log_client.pubsub()
+
+        # Subscribe to the worker logs channel (published by worker's LogManager)
+        await pubsub.subscribe("logs:all")
+
+        print("[SocketHub] Worker logs listener ready, listening on 'logs:all' channel")
+
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                try:
+                    log_data = json.loads(message["data"])
+
+                    # Extract room_id or post_id from context
+                    request_id = log_data.get("request_id")
+
+                    # Emit to all connected clients (broadcast)
+                    # or to specific room if request_id is available
+                    event_data = {
+                        "level": log_data.get("level", "INFO"),
+                        "message": log_data.get("message", ""),
+                        "timestamp": log_data.get("timestamp", ""),
+                        "module": log_data.get("module", ""),
+                        "request_id": request_id,
+                    }
+
+                    if request_id:
+                        # Emit to specific room (post_id == request_id in most cases)
+                        await sio.emit("worker_log", event_data, room=request_id)
+                    else:
+                        # Broadcast to all connected clients
+                        await sio.emit("worker_log", event_data)
+
+                    msg_preview = log_data.get("message", "")[:60]
+                    print(
+                        f"[SocketHub] Streamed log: [{log_data.get('level')}] {msg_preview}"
+                    )
+
+                except json.JSONDecodeError:
+                    pass  # Skip malformed messages
+                except Exception as e:
+                    print(f"[SocketHub] Error processing log: {e}")
+
+    except Exception as e:
+        print(f"[SocketHub] Worker logs listener error: {e}")
+    finally:
+        if redis_log_client:
+            await redis_log_client.close()
