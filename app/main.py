@@ -28,46 +28,94 @@ consumer: AIOKafkaConsumer = None
 redis_log_client = None  # For subscribing to worker logs via Redis pub/sub
 
 
+async def _init_kafka() -> tuple[AIOKafkaProducer | None, AIOKafkaConsumer | None]:
+    """Initialize Kafka producer and consumer. Returns (producer, consumer) tuple."""
+    try:
+        kafka_producer = AIOKafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            linger_ms=2,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+        await kafka_producer.start()
+        print("[Kafka] Producer started")
+
+        kafka_consumer = AIOKafkaConsumer(
+            RESULTS_TOPIC,
+            group_id="socket-hub-result-consumers",
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            auto_offset_reset="latest",
+            value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        )
+        await kafka_consumer.start()
+        print("[Kafka] Consumer started")
+
+        return kafka_producer, kafka_consumer
+    except Exception as e:
+        # Do NOT crash the app if Kafka is down in Azure
+        print(f"[Kafka] Disabled due to startup failure: {e}")
+        return None, None
+
+
+async def _shutdown_kafka(
+    kafka_producer: AIOKafkaProducer | None, kafka_consumer: AIOKafkaConsumer | None
+) -> None:
+    """Shutdown Kafka producer and consumer gracefully."""
+    try:
+        if kafka_consumer is not None:
+            await kafka_consumer.stop()
+    except Exception as e:
+        print(f"[Kafka] Consumer stop failed: {e}")
+
+    try:
+        if kafka_producer is not None:
+            await kafka_producer.stop()
+    except Exception as e:
+        print(f"[Kafka] Producer stop failed: {e}")
+
+
 # LIFESPAN EVENT: START/STOP
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global producer, consumer
 
-    # Redis connect
-    await room_manager.connect()
+    enable_kafka = os.getenv("ENABLE_KAFKA", "true").lower() == "true"
+    task_results = None
+    task_logs = None
 
-    # Kafka producer
-    producer = AIOKafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        linger_ms=2,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    )
-    await producer.start()
+    # Redis connect (must not kill app if it fails)
+    try:
+        await room_manager.connect()
+        print("[Redis] Connected")
+    except Exception as e:
+        print(f"[Redis] Connection failed: {e}")
 
-    # Kafka consumer for worker results
-    consumer = AIOKafkaConsumer(
-        RESULTS_TOPIC,
-        group_id="socket-hub-result-consumers",
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        auto_offset_reset="latest",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-    )
-    await consumer.start()
+    # Kafka init
+    if enable_kafka:
+        producer, consumer = await _init_kafka()
+        if consumer is not None:
+            task_results = asyncio.create_task(worker_results_listener())
+    else:
+        print("[Kafka] Disabled (ENABLE_KAFKA=false)")
+        producer, consumer = None, None
 
-    # async background listener
-    task = asyncio.create_task(worker_results_listener())
+    # Redis log listener can still run if Redis is available.
+    task_logs = asyncio.create_task(worker_logs_listener())
 
-    # Redis log listener for worker logs
-    redis_log_task = asyncio.create_task(worker_logs_listener())
+    try:
+        yield
+    finally:
+        # cancel tasks
+        for t in (task_results, task_logs):
+            if t:
+                t.cancel()
 
-    yield
+        await _shutdown_kafka(producer, consumer)
 
-    # shutdown
-    task.cancel()
-    redis_log_task.cancel()
-    await consumer.stop()
-    await producer.stop()
-    await room_manager.disconnect()
+        # disconnect redis
+        try:
+            await room_manager.disconnect()
+        except Exception as e:
+            print(f"[Redis] Disconnect failed: {e}")
 
 
 # FastAPI app
@@ -120,7 +168,10 @@ async def post_message(sid, data):
     await room_manager.enqueue_post(room_id, payload)
 
     # publish into Kafka for dispatcher
-    await producer.send_and_wait(POSTS_TOPIC, payload)
+    if producer is not None:
+        await producer.send_and_wait(POSTS_TOPIC, payload)
+    else:
+        print("[Kafka] Skipped publish (Kafka disabled)")
 
     await sio.emit("post_queued", {"post_id": post_id}, room=room_id)
     print(f"[Socket] Published post {post_id} to Kafka")
@@ -132,6 +183,11 @@ async def worker_results_listener():
     This listens to worker outputs in Kafka and forwards them
     to the correct socket.io room.
     """
+
+    if consumer is None:
+        print("[SocketHub] Kafka consumer not available; results listener not started.")
+        return
+
     print("[SocketHub] Worker results listener started...")
 
     async for msg in consumer:

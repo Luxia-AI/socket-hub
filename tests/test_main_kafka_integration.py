@@ -21,16 +21,22 @@ async def redis_room_manager():
     manager = RoomManager(redis_url="redis://localhost:6379")
     try:
         await manager.connect()
+        # Verify connection is actually working with a ping
+        if manager.redis:
+            await manager.redis.ping()  # type: ignore[misc]
     except Exception as e:
         pytest.skip(f"Redis not available: {e}")
     yield manager
-    # Cleanup
-    if manager.redis:
-        # Clear test data
-        keys = await manager.redis.keys("room:test_room_*")  # type: ignore[misc]
-        if keys:
-            await manager.redis.delete(*keys)  # type: ignore[misc]
-        await manager.disconnect()
+    # Cleanup - handle errors gracefully
+    try:
+        if manager.redis:
+            # Clear test data
+            keys = await manager.redis.keys("room:test_room_*")  # type: ignore[misc]
+            if keys:
+                await manager.redis.delete(*keys)  # type: ignore[misc]
+            await manager.disconnect()
+    except Exception:
+        pass  # Ignore cleanup errors if Redis connection was lost
 
 
 @fixture
@@ -38,14 +44,19 @@ async def redis_connection():
     """Direct Redis connection for testing"""
     try:
         redis = await from_url("redis://localhost:6379", decode_responses=True)
+        # Verify connection is actually working
+        await redis.ping()  # type: ignore[misc]
     except Exception as e:
         pytest.skip(f"Redis not available: {e}")
     yield redis
-    # Cleanup
-    keys = await redis.keys("room:test_room_*")  # type: ignore[misc]
-    if keys:
-        await redis.delete(*keys)  # type: ignore[misc]
-    await redis.close()
+    # Cleanup - handle errors gracefully
+    try:
+        keys = await redis.keys("room:test_room_*")  # type: ignore[misc]
+        if keys:
+            await redis.delete(*keys)  # type: ignore[misc]
+        await redis.close()
+    except Exception:
+        pass  # Ignore cleanup errors if Redis connection was lost
 
 
 class TestMainApplicationEndpoints:
