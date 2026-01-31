@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from app.api.routes import router
 from app.sockets.manager import RoomManager
 
-KAFKA_BOOTSTRAP = "kafka:9092"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 POSTS_TOPIC = "posts.inbound"
 RESULTS_TOPIC = "jobs.results"
 
@@ -25,6 +25,52 @@ sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
 producer: AIOKafkaProducer = None
 consumer: AIOKafkaConsumer = None
+redis_log_client = None  # For subscribing to worker logs via Redis pub/sub
+
+
+async def _init_kafka() -> tuple[AIOKafkaProducer | None, AIOKafkaConsumer | None]:
+    """Initialize Kafka producer and consumer. Returns (producer, consumer) tuple."""
+    try:
+        kafka_producer = AIOKafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            linger_ms=2,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+        await kafka_producer.start()
+        print("[Kafka] Producer started")
+
+        kafka_consumer = AIOKafkaConsumer(
+            RESULTS_TOPIC,
+            group_id="socket-hub-result-consumers",
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            auto_offset_reset="latest",
+            value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        )
+        await kafka_consumer.start()
+        print("[Kafka] Consumer started")
+
+        return kafka_producer, kafka_consumer
+    except Exception as e:
+        # Do NOT crash the app if Kafka is down in Azure
+        print(f"[Kafka] Disabled due to startup failure: {e}")
+        return None, None
+
+
+async def _shutdown_kafka(
+    kafka_producer: AIOKafkaProducer | None, kafka_consumer: AIOKafkaConsumer | None
+) -> None:
+    """Shutdown Kafka producer and consumer gracefully."""
+    try:
+        if kafka_consumer is not None:
+            await kafka_consumer.stop()
+    except Exception as e:
+        print(f"[Kafka] Consumer stop failed: {e}")
+
+    try:
+        if kafka_producer is not None:
+            await kafka_producer.stop()
+    except Exception as e:
+        print(f"[Kafka] Producer stop failed: {e}")
 
 
 # LIFESPAN EVENT: START/STOP
@@ -32,37 +78,44 @@ consumer: AIOKafkaConsumer = None
 async def lifespan(_app: FastAPI):
     global producer, consumer
 
-    # Redis connect
-    await room_manager.connect()
+    enable_kafka = os.getenv("ENABLE_KAFKA", "true").lower() == "true"
+    task_results = None
+    task_logs = None
 
-    # Kafka producer
-    producer = AIOKafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        linger_ms=2,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    )
-    await producer.start()
+    # Redis connect (must not kill app if it fails)
+    try:
+        await room_manager.connect()
+        print("[Redis] Connected")
+    except Exception as e:
+        print(f"[Redis] Connection failed: {e}")
 
-    # Kafka consumer for worker results
-    consumer = AIOKafkaConsumer(
-        RESULTS_TOPIC,
-        group_id="socket-hub-result-consumers",
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        auto_offset_reset="latest",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-    )
-    await consumer.start()
+    # Kafka init
+    if enable_kafka:
+        producer, consumer = await _init_kafka()
+        if consumer is not None:
+            task_results = asyncio.create_task(worker_results_listener())
+    else:
+        print("[Kafka] Disabled (ENABLE_KAFKA=false)")
+        producer, consumer = None, None
 
-    # async background listener
-    task = asyncio.create_task(worker_results_listener())
+    # Redis log listener can still run if Redis is available.
+    task_logs = asyncio.create_task(worker_logs_listener())
 
-    yield
+    try:
+        yield
+    finally:
+        # cancel tasks
+        for t in (task_results, task_logs):
+            if t:
+                t.cancel()
 
-    # shutdown
-    task.cancel()
-    await consumer.stop()
-    await producer.stop()
-    await room_manager.disconnect()
+        await _shutdown_kafka(producer, consumer)
+
+        # disconnect redis
+        try:
+            await room_manager.disconnect()
+        except Exception as e:
+            print(f"[Redis] Disconnect failed: {e}")
 
 
 # FastAPI app
@@ -91,7 +144,7 @@ async def disconnect(sid):
 async def join_room(sid, data):
     room_id = data.get("room_id")
     await sio.save_session(sid, {"room_id": room_id})
-    sio.enter_room(sid, room_id)
+    await sio.enter_room(sid, room_id)
     await room_manager.create_room(room_id)
     print(f"[Socket] {sid} joined room {room_id}")
 
@@ -115,7 +168,10 @@ async def post_message(sid, data):
     await room_manager.enqueue_post(room_id, payload)
 
     # publish into Kafka for dispatcher
-    await producer.send_and_wait(POSTS_TOPIC, payload)
+    if producer is not None:
+        await producer.send_and_wait(POSTS_TOPIC, payload)
+    else:
+        print("[Kafka] Skipped publish (Kafka disabled)")
 
     await sio.emit("post_queued", {"post_id": post_id}, room=room_id)
     print(f"[Socket] Published post {post_id} to Kafka")
@@ -127,6 +183,11 @@ async def worker_results_listener():
     This listens to worker outputs in Kafka and forwards them
     to the correct socket.io room.
     """
+
+    if consumer is None:
+        print("[SocketHub] Kafka consumer not available; results listener not started.")
+        return
+
     print("[SocketHub] Worker results listener started...")
 
     async for msg in consumer:
@@ -140,3 +201,66 @@ async def worker_results_listener():
         await sio.emit("worker_update", result, room=post_id)
 
         print(f"[SocketHub] Emitted worker result for post {post_id}")
+
+
+# REDIS LOG SUBSCRIPTION -> EMIT TO SOCKET ROOMS
+async def worker_logs_listener():
+    """
+    This subscribes to worker logs via Redis pub/sub and forwards them
+    to the correct socket.io room.
+    """
+    global redis_log_client
+
+    print("[SocketHub] Worker logs listener starting...")
+
+    try:
+        import redis.asyncio as aioredis
+
+        redis_log_client = await aioredis.from_url(REDIS_URL)
+        pubsub = redis_log_client.pubsub()
+
+        # Subscribe to the worker logs channel (published by worker's LogManager)
+        await pubsub.subscribe("logs:all")
+
+        print("[SocketHub] Worker logs listener ready, listening on 'logs:all' channel")
+
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                try:
+                    log_data = json.loads(message["data"])
+
+                    # Extract room_id or post_id from context
+                    request_id = log_data.get("request_id")
+
+                    # Emit to all connected clients (broadcast)
+                    # or to specific room if request_id is available
+                    event_data = {
+                        "level": log_data.get("level", "INFO"),
+                        "message": log_data.get("message", ""),
+                        "timestamp": log_data.get("timestamp", ""),
+                        "module": log_data.get("module", ""),
+                        "request_id": request_id,
+                    }
+
+                    if request_id:
+                        # Emit to specific room (post_id == request_id in most cases)
+                        await sio.emit("worker_log", event_data, room=request_id)
+                    else:
+                        # Broadcast to all connected clients
+                        await sio.emit("worker_log", event_data)
+
+                    msg_preview = log_data.get("message", "")[:60]
+                    print(
+                        f"[SocketHub] Streamed log: [{log_data.get('level')}] {msg_preview}"
+                    )
+
+                except json.JSONDecodeError:
+                    pass  # Skip malformed messages
+                except Exception as e:
+                    print(f"[SocketHub] Error processing log: {e}")
+
+    except Exception as e:
+        print(f"[SocketHub] Worker logs listener error: {e}")
+    finally:
+        if redis_log_client:
+            await redis_log_client.close()
