@@ -284,15 +284,22 @@ async def worker_results_listener():
 
     async for msg in consumer:
         result = msg.value
+        job_id = result.get("job_id")
         post_id = result.get("post_id")
+        room_id = result.get("room_id")
 
-        if not post_id:
+        if not job_id:
             continue
 
-        # emit to socket room (room_id == post_id)
-        await sio.emit("worker_update", result, room=post_id)
-
-        print(f"[SocketHub] Emitted worker result for post {post_id}")
+        # Emit to the room the client originally joined
+        target_room = room_id or post_id
+        if target_room:
+            await sio.emit("worker_update", result, room=target_room)
+            print(
+                f"[SocketHub] Emitted worker result for job {job_id} to room {target_room}"
+            )
+        else:
+            print(f"[SocketHub] No room_id or post_id for job {job_id}, skipping emit")
 
 
 # REDIS LOG SUBSCRIPTION -> EMIT TO SOCKET ROOMS
