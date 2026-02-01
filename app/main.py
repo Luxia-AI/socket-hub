@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 import socketio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer  # type: ignore
+from aiokafka.errors import KafkaConnectionError, KafkaError  # type: ignore
 from fastapi import FastAPI
 
 from app.api.routes import router
@@ -15,7 +16,8 @@ from app.sockets.manager import RoomManager
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 POSTS_TOPIC = "posts.inbound"
 RESULTS_TOPIC = "jobs.results"
-
+KAFKA_AVAILABLE = False
+REDIS_AVAILABLE = False
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 room_manager = RoomManager(redis_url=REDIS_URL)
@@ -29,7 +31,6 @@ redis_log_client = None  # For subscribing to worker logs via Redis pub/sub
 
 
 async def _init_kafka() -> tuple[AIOKafkaProducer | None, AIOKafkaConsumer | None]:
-    """Initialize Kafka producer and consumer. Returns (producer, consumer) tuple."""
     try:
         kafka_producer = AIOKafkaProducer(
             bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -50,9 +51,20 @@ async def _init_kafka() -> tuple[AIOKafkaProducer | None, AIOKafkaConsumer | Non
         print("[Kafka] Consumer started")
 
         return kafka_producer, kafka_consumer
+
     except Exception as e:
-        # Do NOT crash the app if Kafka is down in Azure
         print(f"[Kafka] Disabled due to startup failure: {e}")
+        # best-effort cleanup if partially started
+        try:
+            if "kafka_producer" in locals() and kafka_producer is not None:
+                await kafka_producer.stop()
+        except Exception as e:
+            print(f"[Kafka] Producer cleanup failed: {e}")
+        try:
+            if "kafka_consumer" in locals() and kafka_consumer is not None:
+                await kafka_consumer.stop()
+        except Exception as e:
+            print(f"[Kafka] Consumer cleanup failed: {e}")
         return None, None
 
 
@@ -76,29 +88,43 @@ async def _shutdown_kafka(
 # LIFESPAN EVENT: START/STOP
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global producer, consumer
+    global producer, consumer, KAFKA_AVAILABLE, REDIS_AVAILABLE
 
     enable_kafka = os.getenv("ENABLE_KAFKA", "true").lower() == "true"
-    task_results = None
-    task_logs = None
+    task_results: asyncio.Task | None = None
+    task_logs: asyncio.Task | None = None
 
-    # Redis connect (must not kill app if it fails)
+    # ---- Redis connect (never crash app) ----
     try:
         await room_manager.connect()
+        REDIS_AVAILABLE = True
         print("[Redis] Connected")
     except Exception as e:
+        REDIS_AVAILABLE = False
         print(f"[Redis] Connection failed: {e}")
 
-    # Kafka init
+    # ---- Kafka init (best-effort) ----
+    producer = None
+    consumer = None
+    KAFKA_AVAILABLE = False
+
     if enable_kafka:
-        producer, consumer = await _init_kafka()
-        if consumer is not None:
-            task_results = asyncio.create_task(worker_results_listener())
+        try:
+            producer, consumer = await _init_kafka()
+            KAFKA_AVAILABLE = producer is not None and consumer is not None
+
+            if consumer is not None:
+                task_results = asyncio.create_task(worker_results_listener())
+        except Exception as e:
+            # absolutely never crash startup due to Kafka
+            KAFKA_AVAILABLE = False
+            producer = None
+            consumer = None
+            print(f"[Kafka] Startup failed; continuing without Kafka: {e}")
     else:
         print("[Kafka] Disabled (ENABLE_KAFKA=false)")
-        producer, consumer = None, None
 
-    # Redis log listener can still run if Redis is available.
+    # ---- Redis log listener (best-effort) ----
     task_logs = asyncio.create_task(worker_logs_listener())
 
     try:
@@ -109,13 +135,16 @@ async def lifespan(_app: FastAPI):
             if t:
                 t.cancel()
 
+        # stop kafka gracefully
         await _shutdown_kafka(producer, consumer)
+        KAFKA_AVAILABLE = False
 
         # disconnect redis
         try:
             await room_manager.disconnect()
         except Exception as e:
             print(f"[Redis] Disconnect failed: {e}")
+        REDIS_AVAILABLE = False
 
 
 # FastAPI app
@@ -149,6 +178,21 @@ async def join_room(sid, data):
     print(f"[Socket] {sid} joined room {room_id}")
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    return {
+        "status": "ready",
+        "redis": REDIS_AVAILABLE,
+        "kafka": KAFKA_AVAILABLE,
+        "kafka_bootstrap": KAFKA_BOOTSTRAP if KAFKA_AVAILABLE else None,
+    }
+
+
 # POST MESSAGE EVENT -> PUBLISH TO KAFKA -> DISPATCHER
 @sio.event
 async def post_message(sid, data):
@@ -167,14 +211,18 @@ async def post_message(sid, data):
     # push into Redis queue (optional for internal pipeline)
     await room_manager.enqueue_post(room_id, payload)
 
-    # publish into Kafka for dispatcher
+    # publish into Kafka for dispatcher (best-effort)
     if producer is not None:
-        await producer.send_and_wait(POSTS_TOPIC, payload)
+        try:
+            await producer.send_and_wait(POSTS_TOPIC, payload)
+            print(f"[Kafka] Published post {post_id} to {POSTS_TOPIC}")
+        except (KafkaConnectionError, KafkaError, OSError) as e:
+            # degrade gracefully: payload still in Redis queue
+            print(f"[Kafka] Publish failed; queued in Redis only: {e}")
     else:
         print("[Kafka] Skipped publish (Kafka disabled)")
 
-    await sio.emit("post_queued", {"post_id": post_id}, room=room_id)
-    print(f"[Socket] Published post {post_id} to Kafka")
+    print(f"[Socket] Post queued: {post_id}")
 
 
 # KAFKA WORKER RESULTS -> EMIT TO SOCKET ROOMS
