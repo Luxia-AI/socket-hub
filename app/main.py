@@ -208,7 +208,14 @@ async def join_room(sid, data):
     room_id = data.get("room_id")
     await sio.save_session(sid, {"room_id": room_id})
     await sio.enter_room(sid, room_id)
-    await room_manager.create_room(room_id)
+
+    # Redis room tracking is optional - pipeline works via Kafka without it
+    if REDIS_AVAILABLE:
+        try:
+            await room_manager.create_room(room_id)
+        except Exception as e:
+            print(f"[Redis] Room creation failed (non-fatal): {e}")
+
     print(f"[Socket] {sid} joined room {room_id}")
 
 
@@ -242,17 +249,20 @@ async def post_message(sid, data):
         "user_socket_id": sid,
     }
 
-    # push into Redis queue (optional for internal pipeline)
-    await room_manager.enqueue_post(room_id, payload)
+    # push into Redis queue (optional backup - pipeline works via Kafka)
+    if REDIS_AVAILABLE:
+        try:
+            await room_manager.enqueue_post(room_id, payload)
+        except Exception as e:
+            print(f"[Redis] Enqueue failed (non-fatal): {e}")
 
-    # publish into Kafka for dispatcher (best-effort)
+    # publish into Kafka for dispatcher (this is the main pipeline)
     if producer is not None:
         try:
             await producer.send_and_wait(POSTS_TOPIC, payload)
             print(f"[Kafka] Published post {post_id} to {POSTS_TOPIC}")
         except (KafkaConnectionError, KafkaError, OSError) as e:
-            # degrade gracefully: payload still in Redis queue
-            print(f"[Kafka] Publish failed; queued in Redis only: {e}")
+            print(f"[Kafka] Publish failed: {e}")
     else:
         print("[Kafka] Skipped publish (Kafka disabled)")
 
