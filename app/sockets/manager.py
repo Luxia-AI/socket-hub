@@ -1,4 +1,5 @@
 import json
+import ssl
 from typing import Any
 
 from redis.asyncio import Redis, from_url
@@ -16,8 +17,27 @@ class RoomManager:
 
     async def connect(self) -> None:
         """Establish async connection to Redis"""
-        self.redis = await from_url(self.redis_url, decode_responses=True)
-        print("[Redis] Connected")
+        # Azure Redis requires SSL (rediss:// or port 6380)
+        ssl_enabled = (
+            self.redis_url.startswith("rediss://") or ":6380" in self.redis_url
+        )
+
+        if ssl_enabled:
+            # Azure Redis with SSL
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            self.redis = await from_url(
+                self.redis_url,
+                decode_responses=True,
+                ssl=ssl_context,
+                socket_timeout=30.0,
+                socket_connect_timeout=30.0,
+            )
+        else:
+            self.redis = await from_url(self.redis_url, decode_responses=True)
+
+        print(f"[Redis] Connected (ssl={ssl_enabled})")
 
     async def disconnect(self) -> None:
         """Close connection to Redis"""
