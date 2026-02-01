@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import ssl
 import uuid
 from contextlib import asynccontextmanager
 
@@ -13,7 +14,13 @@ from fastapi import FastAPI
 from app.api.routes import router
 from app.sockets.manager import RoomManager
 
+# Kafka Configuration
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+KAFKA_SASL_MECHANISM = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
+KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
+KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
+
 POSTS_TOPIC = "posts.inbound"
 RESULTS_TOPIC = "jobs.results"
 KAFKA_AVAILABLE = False
@@ -21,6 +28,29 @@ REDIS_AVAILABLE = False
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 room_manager = RoomManager(redis_url=REDIS_URL)
+
+
+def _get_kafka_config() -> dict:
+    """Build Kafka client configuration with optional SASL/SSL for Azure Event Hubs."""
+    config = {
+        "bootstrap_servers": KAFKA_BOOTSTRAP,
+    }
+
+    # Azure Event Hubs requires SASL_SSL
+    if KAFKA_SECURITY_PROTOCOL == "SASL_SSL":
+        ssl_context = ssl.create_default_context()
+        config.update(
+            {
+                "security_protocol": "SASL_SSL",
+                "sasl_mechanism": KAFKA_SASL_MECHANISM,
+                "sasl_plain_username": KAFKA_SASL_USERNAME,
+                "sasl_plain_password": KAFKA_SASL_PASSWORD,
+                "ssl_context": ssl_context,
+            }
+        )
+
+    return config
+
 
 # Socket.IO server
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
@@ -32,23 +62,27 @@ redis_log_client = None  # For subscribing to worker logs via Redis pub/sub
 
 async def _init_kafka() -> tuple[AIOKafkaProducer | None, AIOKafkaConsumer | None]:
     try:
+        kafka_config = _get_kafka_config()
+
         kafka_producer = AIOKafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP,
+            **kafka_config,
             linger_ms=2,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         )
         await kafka_producer.start()
-        print("[Kafka] Producer started")
+        print(
+            f"[Kafka] Producer started (bootstrap={KAFKA_BOOTSTRAP}, protocol={KAFKA_SECURITY_PROTOCOL})"
+        )
 
         kafka_consumer = AIOKafkaConsumer(
             RESULTS_TOPIC,
             group_id="socket-hub-result-consumers",
-            bootstrap_servers=KAFKA_BOOTSTRAP,
+            **kafka_config,
             auto_offset_reset="latest",
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         )
         await kafka_consumer.start()
-        print("[Kafka] Consumer started")
+        print(f"[Kafka] Consumer started (topic={RESULTS_TOPIC})")
 
         return kafka_producer, kafka_consumer
 
