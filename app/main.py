@@ -306,12 +306,18 @@ async def worker_logs_listener():
 
         if ssl_enabled:
             # Azure Redis with SSL (port 6380)
-            redis_log_client = await aioredis.from_url(
+            redis_log_client = aioredis.from_url(
                 redis_url,
-                ssl_cert_reqs=None,  # Azure Redis uses managed certs
+                ssl_cert_reqs="none",  # String "none" to disable cert verification
+                socket_timeout=60.0,
+                socket_connect_timeout=60.0,
+                retry_on_timeout=True,
             )
         else:
-            redis_log_client = await aioredis.from_url(redis_url)
+            redis_log_client = aioredis.from_url(redis_url)
+
+        # Test connection
+        await redis_log_client.ping()
 
         pubsub = redis_log_client.pubsub()
 

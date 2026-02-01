@@ -22,20 +22,22 @@ class RoomManager:
         )
 
         if ssl_enabled:
-            # Azure Redis with SSL - use ssl_cert_reqs for rediss:// URLs
-            # The rediss:// scheme automatically enables SSL, we just need to
-            # disable cert verification for Azure Redis
-            self.redis = await from_url(
+            # Azure Redis with SSL - use ssl_cert_reqs="none" (string) for rediss:// URLs
+            # The rediss:// scheme automatically enables SSL
+            self.redis = from_url(
                 self.redis_url,
                 decode_responses=True,
-                ssl_cert_reqs=None,  # Disable cert verification for Azure
-                socket_timeout=30.0,
-                socket_connect_timeout=30.0,
+                ssl_cert_reqs="none",  # String "none" to disable cert verification
+                socket_timeout=60.0,
+                socket_connect_timeout=60.0,
+                retry_on_timeout=True,
             )
         else:
-            self.redis = await from_url(self.redis_url, decode_responses=True)
+            self.redis = from_url(self.redis_url, decode_responses=True)
 
-        print(f"[Redis] Connected (ssl={ssl_enabled})")
+        # Actually test the connection (from_url doesn't connect, it just creates client)
+        await self.redis.ping()
+        print(f"[Redis] Connected and verified (ssl={ssl_enabled})")
 
     async def disconnect(self) -> None:
         """Close connection to Redis"""
