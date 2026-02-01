@@ -1,5 +1,4 @@
 import json
-import ssl
 from typing import Any
 
 from redis.asyncio import Redis, from_url
@@ -23,14 +22,13 @@ class RoomManager:
         )
 
         if ssl_enabled:
-            # Azure Redis with SSL
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+            # Azure Redis with SSL - use ssl_cert_reqs for rediss:// URLs
+            # The rediss:// scheme automatically enables SSL, we just need to
+            # disable cert verification for Azure Redis
             self.redis = await from_url(
                 self.redis_url,
                 decode_responses=True,
-                ssl=ssl_context,
+                ssl_cert_reqs=None,  # Disable cert verification for Azure
                 socket_timeout=30.0,
                 socket_connect_timeout=30.0,
             )
