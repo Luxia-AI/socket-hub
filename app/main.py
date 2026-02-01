@@ -293,12 +293,26 @@ async def worker_logs_listener():
     """
     global redis_log_client
 
-    print("[SocketHub] Worker logs listener starting...")
+    print(
+        f"[SocketHub] Worker logs listener starting... (REDIS_URL={REDIS_URL[:30]}...)"
+    )
 
     try:
         import redis.asyncio as aioredis
 
-        redis_log_client = await aioredis.from_url(REDIS_URL)
+        # Azure Redis requires SSL - detect and configure accordingly
+        redis_url = REDIS_URL
+        ssl_enabled = redis_url.startswith("rediss://") or ":6380" in redis_url
+
+        if ssl_enabled:
+            # Azure Redis with SSL (port 6380)
+            redis_log_client = await aioredis.from_url(
+                redis_url,
+                ssl_cert_reqs=None,  # Azure Redis uses managed certs
+            )
+        else:
+            redis_log_client = await aioredis.from_url(redis_url)
+
         pubsub = redis_log_client.pubsub()
 
         # Subscribe to the worker logs channel (published by worker's LogManager)
