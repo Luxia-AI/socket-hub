@@ -234,6 +234,75 @@ async def ready():
     }
 
 
+# HTTP Fallback URL for direct worker calls (when Kafka is unavailable)
+WORKER_HTTP_URL = os.getenv("WORKER_HTTP_URL", "http://localhost:8002")
+
+
+async def _call_worker_http(payload: dict, room_id: str) -> None:
+    """Call worker directly via HTTP and emit result to socket room."""
+    import httpx
+
+    try:
+        print(f"[HTTP Fallback] Calling worker directly for post {payload['post_id']}")
+
+        # Emit processing status
+        await sio.emit(
+            "worker_update",
+            {
+                "job_id": payload["post_id"],
+                "post_id": payload["post_id"],
+                "room_id": room_id,
+                "status": "processing",
+                "message": "Starting RAG pipeline (HTTP fallback)...",
+            },
+            room=room_id,
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            response = await client.post(
+                f"{WORKER_HTTP_URL}/worker/verify",
+                json={
+                    "claim": payload["text"],
+                    "post_id": payload["post_id"],
+                    "room_id": room_id,
+                    "domain": "general",
+                },
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                # Emit the result to the socket room
+                await sio.emit("worker_update", result, room=room_id)
+                print(f"[HTTP Fallback] Result emitted to room {room_id}")
+            else:
+                print(f"[HTTP Fallback] Worker returned error: {response.status_code}")
+                await sio.emit(
+                    "worker_update",
+                    {
+                        "job_id": payload["post_id"],
+                        "post_id": payload["post_id"],
+                        "room_id": room_id,
+                        "status": "error",
+                        "error": f"Worker HTTP error: {response.status_code}",
+                    },
+                    room=room_id,
+                )
+
+    except Exception as e:
+        print(f"[HTTP Fallback] Error: {e}")
+        await sio.emit(
+            "worker_update",
+            {
+                "job_id": payload["post_id"],
+                "post_id": payload["post_id"],
+                "room_id": room_id,
+                "status": "error",
+                "error": f"HTTP fallback failed: {e}",
+            },
+            room=room_id,
+        )
+
+
 # POST MESSAGE EVENT -> PUBLISH TO KAFKA -> DISPATCHER
 @sio.event
 async def post_message(sid, data):
@@ -257,14 +326,25 @@ async def post_message(sid, data):
             print(f"[Redis] Enqueue failed (non-fatal): {e}")
 
     # publish into Kafka for dispatcher (this is the main pipeline)
+    kafka_success = False
     if producer is not None:
         try:
             await producer.send_and_wait(POSTS_TOPIC, payload)
             print(f"[Kafka] Published post {post_id} to {POSTS_TOPIC}")
+            kafka_success = True
         except (KafkaConnectionError, KafkaError, OSError) as e:
             print(f"[Kafka] Publish failed: {e}")
     else:
         print("[Kafka] Skipped publish (Kafka disabled)")
+
+    # HTTP fallback: call worker directly if Kafka failed
+    if not kafka_success and payload.get("text"):
+        print(f"[Socket] Using HTTP fallback for post {post_id}")
+        # Fire-and-forget HTTP call to worker (runs in background)
+        _http_task = asyncio.create_task(_call_worker_http(payload, room_id))
+        _http_task.add_done_callback(
+            lambda t: t.exception() if t.done() and not t.cancelled() else None
+        )
 
     print(f"[Socket] Post queued: {post_id}")
 
