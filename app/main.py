@@ -326,7 +326,7 @@ async def _call_worker_http(payload: dict, room_id: str) -> None:
 @sio.event
 async def post_message(sid, data):
     session = await sio.get_session(sid)
-    room_id = session.get("room_id")
+    room_id = data.get("room_id") or session.get("room_id")
 
     post_id = str(uuid.uuid4())
     payload = {
