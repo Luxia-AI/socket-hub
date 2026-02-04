@@ -14,6 +14,25 @@ from fastapi import FastAPI
 from app.api.routes import router
 from app.sockets.manager import RoomManager
 
+
+# Helper to mask sensitive info in Redis URLs
+def mask_url(url: str) -> str:
+    # Only mask if URL contains credentials
+    if "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    if "@" in rest:
+        userinfo, host = rest.split("@", 1)
+        # Mask password if present
+        if ":" in userinfo:
+            user, _ = userinfo.split(":", 1)
+            masked = f"{user}:***"
+        else:
+            masked = "***"
+        return f"{scheme}://{masked}@{host}"
+    return url
+
+
 # Kafka Configuration
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
@@ -132,7 +151,7 @@ async def lifespan(_app: FastAPI):
     try:
         await room_manager.connect()
         REDIS_AVAILABLE = True
-        print("[Redis] Connected")
+        print(f"[Redis] Connected to {mask_url(REDIS_URL)}")
     except Exception as e:
         REDIS_AVAILABLE = False
         print(f"[Redis] Connection failed: {e}")
@@ -390,9 +409,7 @@ async def worker_logs_listener():
     """
     global redis_log_client
 
-    print(
-        f"[SocketHub] Worker logs listener starting... (REDIS_URL={REDIS_URL[:30]}...)"
-    )
+    print(f"[SocketHub] Worker logs listener starting... (redis={mask_url(REDIS_URL)})")
 
     try:
         import redis.asyncio as aioredis
