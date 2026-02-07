@@ -77,6 +77,18 @@ sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 producer: AIOKafkaProducer = None
 consumer: AIOKafkaConsumer = None
 redis_log_client = None  # For subscribing to worker logs via Redis pub/sub
+_completed_forward_guard: dict[str, float] = {}
+_COMPLETED_GUARD_TTL_SECONDS = 3600.0
+
+
+def _gc_completed_forward_guard(now: float) -> None:
+    expired = [
+        job
+        for job, ts in _completed_forward_guard.items()
+        if now - ts > _COMPLETED_GUARD_TTL_SECONDS
+    ]
+    for job in expired:
+        _completed_forward_guard.pop(job, None)
 
 
 async def _init_kafka() -> tuple[AIOKafkaProducer | None, AIOKafkaConsumer | None]:
@@ -386,6 +398,7 @@ async def worker_results_listener():
         job_id = result.get("job_id")
         post_id = result.get("post_id")
         room_id = result.get("room_id")
+        event_type = result.get("event_type")
 
         if not job_id:
             continue
@@ -393,9 +406,18 @@ async def worker_results_listener():
         # Emit to the room the client originally joined
         target_room = room_id or post_id
         if target_room:
+            now = asyncio.get_event_loop().time()
+            _gc_completed_forward_guard(now)
+            if event_type == "completed":
+                if job_id in _completed_forward_guard:
+                    print(
+                        f"[SocketHub] Dropped duplicate completed event for job {job_id}"
+                    )
+                    continue
+                _completed_forward_guard[job_id] = now
             await sio.emit("worker_update", result, room=target_room)
             print(
-                f"[SocketHub] Emitted worker result for job {job_id} to room {target_room}"
+                f"[SocketHub] Emitted {event_type or 'legacy'} event for job {job_id} to room {target_room}"
             )
         else:
             print(f"[SocketHub] No room_id or post_id for job {job_id}, skipping emit")
