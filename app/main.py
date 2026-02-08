@@ -9,7 +9,8 @@ from contextlib import asynccontextmanager
 import socketio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer  # type: ignore
 from aiokafka.errors import KafkaConnectionError, KafkaError  # type: ignore
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 
 from app.api.routes import router
 from app.sockets.manager import RoomManager
@@ -46,6 +47,7 @@ KAFKA_AVAILABLE = False
 REDIS_AVAILABLE = False
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+ROOM_ADMIN_TOKEN = os.getenv("ROOM_ADMIN_TOKEN", "")
 room_manager = RoomManager(redis_url=REDIS_URL)
 
 
@@ -266,9 +268,53 @@ app.include_router(router, prefix="/api")
 asgi_app = socketio.ASGIApp(sio, app)
 
 
+class RoomProvisionRequest(BaseModel):
+    room_id: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=8, max_length=256)
+    overwrite: bool = False
+
+
+def _normalize_room_id(room_id: str | None) -> str:
+    return (room_id or "").strip()
+
+
+async def _emit_auth_error(sid: str, message: str, code: str = "unauthorized") -> None:
+    await sio.emit("auth_error", {"code": code, "message": message}, room=sid)
+
+
 @app.get("/")
 async def root():
     return {"message": "Socket Hub running"}
+
+
+@app.post("/api/rooms/register")
+async def register_room(
+    payload: RoomProvisionRequest,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Provision room credentials (owner-only endpoint)."""
+    if not ROOM_ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Room provisioning unavailable: ROOM_ADMIN_TOKEN is not configured.",
+        )
+    if x_admin_token != ROOM_ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid admin token.")
+    if not REDIS_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis unavailable; cannot provision room credentials.",
+        )
+
+    room_id = _normalize_room_id(payload.room_id)
+    if not room_id:
+        raise HTTPException(status_code=400, detail="room_id is required.")
+
+    created = await room_manager.register_room_credentials(
+        room_id, payload.password, overwrite=payload.overwrite
+    )
+    await room_manager.create_room(room_id)
+    return {"room_id": room_id, "created": created, "overwrite": payload.overwrite}
 
 
 # SOCKET EVENTS
@@ -284,18 +330,51 @@ async def disconnect(sid):
 
 @sio.event
 async def join_room(sid, data):
-    room_id = data.get("room_id")
-    await sio.save_session(sid, {"room_id": room_id})
+    if not isinstance(data, dict):
+        await _emit_auth_error(sid, "Invalid join payload.", code="bad_request")
+        return
+
+    room_id = _normalize_room_id(data.get("room_id"))
+    password = str(data.get("password") or "")
+    if not room_id or not password:
+        await _emit_auth_error(
+            sid, "room_id and password are required to join a room.", code="bad_request"
+        )
+        return
+    if not REDIS_AVAILABLE:
+        await _emit_auth_error(
+            sid,
+            "Room authentication is temporarily unavailable.",
+            code="service_unavailable",
+        )
+        return
+
+    try:
+        is_valid = await room_manager.verify_room_password(room_id, password)
+    except Exception as e:
+        print(f"[Socket] Room auth check failed: {e}")
+        await _emit_auth_error(
+            sid, "Room authentication failed. Please retry.", code="service_unavailable"
+        )
+        return
+
+    if not is_valid:
+        await _emit_auth_error(
+            sid, "Invalid room credentials.", code="invalid_credentials"
+        )
+        print(f"[Socket] Rejected join for sid={sid}, room={room_id}")
+        return
+
+    await sio.save_session(sid, {"room_id": room_id, "room_authenticated": True})
     await sio.enter_room(sid, room_id)
 
-    # Redis room tracking is optional - pipeline works via Kafka without it
-    if REDIS_AVAILABLE:
-        try:
-            await room_manager.create_room(room_id)
-        except Exception as e:
-            print(f"[Redis] Room creation failed (non-fatal): {e}")
+    try:
+        await room_manager.create_room(room_id)
+    except Exception as e:
+        print(f"[Redis] Room creation failed (non-fatal): {e}")
 
-    print(f"[Socket] {sid} joined room {room_id}")
+    await sio.emit("join_room_success", {"room_id": room_id}, room=sid)
+    print(f"[Socket] {sid} joined room {room_id} (authenticated)")
 
 
 @app.get("/health")
@@ -382,21 +461,47 @@ async def _call_worker_http(payload: dict, room_id: str) -> None:
         )
 
 
-# POST MESSAGE EVENT -> PUBLISH TO KAFKA -> DISPATCHER
-@sio.event
-async def post_message(sid, data):
-    session = await sio.get_session(sid)
-    room_id = data.get("room_id") or session.get("room_id")
+async def _resolve_post_context(sid: str, data: dict) -> tuple[str, str] | None:
+    try:
+        session = await sio.get_session(sid)
+    except KeyError:
+        session = {}
 
-    post_id = str(uuid.uuid4())
-    payload = {
-        "post_id": post_id,
-        "room_id": room_id,
-        "text": data.get("content"),
-        "timestamp": data.get("timestamp"),
-        "user_socket_id": sid,
-    }
+    session_room_id = _normalize_room_id(session.get("room_id"))
+    requested_room_id = _normalize_room_id(data.get("room_id"))
+    room_id = requested_room_id or session_room_id
 
+    if not session.get("room_authenticated") or not session_room_id:
+        await _emit_auth_error(
+            sid, "You must join a provisioned room before sending claims."
+        )
+        return None
+
+    if requested_room_id and requested_room_id != session_room_id:
+        await _emit_auth_error(
+            sid,
+            "Cannot post to a different room than your authenticated room.",
+            code="forbidden_room",
+        )
+        return None
+
+    content = str(data.get("content") or "").strip()
+    if not content:
+        await sio.emit(
+            "worker_update",
+            {
+                "status": "error",
+                "room_id": room_id,
+                "error": "Claim content is required.",
+            },
+            room=sid,
+        )
+        return None
+
+    return room_id, content
+
+
+async def _dispatch_post(post_id: str, room_id: str, payload: dict) -> None:
     # push into Redis queue (optional backup - pipeline works via Kafka)
     if REDIS_AVAILABLE:
         try:
@@ -424,6 +529,29 @@ async def post_message(sid, data):
         _http_task.add_done_callback(
             lambda t: t.exception() if t.done() and not t.cancelled() else None
         )
+
+
+# POST MESSAGE EVENT -> PUBLISH TO KAFKA -> DISPATCHER
+@sio.event
+async def post_message(sid, data):
+    if not isinstance(data, dict):
+        await _emit_auth_error(sid, "Invalid post payload.", code="bad_request")
+        return
+    context = await _resolve_post_context(sid, data)
+    if context is None:
+        return
+    room_id, content = context
+
+    post_id = str(uuid.uuid4())
+    payload = {
+        "post_id": post_id,
+        "room_id": room_id,
+        "text": content,
+        "timestamp": data.get("timestamp"),
+        "user_socket_id": sid,
+    }
+
+    await _dispatch_post(post_id, room_id, payload)
 
     print(f"[Socket] Post queued: {post_id}")
 

@@ -1,5 +1,7 @@
 import json
 import os
+import secrets
+from hashlib import pbkdf2_hmac
 from typing import Any
 
 from redis.asyncio import Redis, from_url
@@ -24,10 +26,22 @@ class RoomManager:
     ):
         self.redis_url = redis_url
         self.prefix = prefix
+        self.auth_prefix = f"{prefix}_auth"
         if max_queue_size is None:
             max_queue_size = int(os.getenv("ROOM_QUEUE_MAXLEN", "100"))
         self.max_queue_size = max_queue_size
+        self.password_hash_iterations = int(
+            os.getenv("ROOM_PASSWORD_PBKDF2_ITERATIONS", "120000")
+        )
         self.redis: Redis | None = None
+
+    def _hash_password(self, password: str, salt_hex: str) -> str:
+        password_bytes = password.encode("utf-8")
+        salt = bytes.fromhex(salt_hex)
+        digest = pbkdf2_hmac(
+            "sha256", password_bytes, salt, self.password_hash_iterations
+        )
+        return digest.hex()
 
     async def connect(self) -> None:
         """Establish async connection to Redis"""
@@ -69,6 +83,53 @@ class RoomManager:
             await self.redis.lpush(key, json.dumps({"init": True}))  # type: ignore[misc]
             print(f"[Redis] Room {room_id} initialized")
         return key
+
+    async def register_room_credentials(
+        self, room_id: str, password: str, overwrite: bool = False
+    ) -> bool:
+        """Register room credentials in Redis. Returns True when written."""
+        assert self.redis is not None, "Redis not connected"  # nosec
+        key = f"{self.auth_prefix}:{room_id}"
+        exists: int = await self.redis.exists(key)  # type: ignore[misc]
+        if exists and not overwrite:
+            return False
+
+        salt_hex = secrets.token_hex(16)
+        hash_hex = self._hash_password(password, salt_hex)
+        payload = json.dumps(
+            {
+                "room_id": room_id,
+                "salt": salt_hex,
+                "hash": hash_hex,
+                "iterations": self.password_hash_iterations,
+            }
+        )
+        await self.redis.set(key, payload)  # type: ignore[misc]
+        return True
+
+    async def verify_room_password(self, room_id: str, password: str) -> bool:
+        """Validate room password against stored hash."""
+        assert self.redis is not None, "Redis not connected"  # nosec
+        key = f"{self.auth_prefix}:{room_id}"
+        raw: str | None = await self.redis.get(key)  # type: ignore[misc]
+        if not raw:
+            return False
+        parsed = _decode_queue_item(raw)
+        if not parsed:
+            return False
+        salt_hex = str(parsed.get("salt", ""))
+        expected_hash = str(parsed.get("hash", ""))
+        if not salt_hex or not expected_hash:
+            return False
+        candidate_hash = self._hash_password(password, salt_hex)
+        return secrets.compare_digest(expected_hash, candidate_hash)
+
+    async def room_credentials_exist(self, room_id: str) -> bool:
+        """Check if room credentials are provisioned."""
+        assert self.redis is not None, "Redis not connected"  # nosec
+        key = f"{self.auth_prefix}:{room_id}"
+        exists: int = await self.redis.exists(key)  # type: ignore[misc]
+        return bool(exists)
 
     async def enqueue_post(self, room_id: str, post: dict[str, Any]) -> None:
         """Add a post to the room queue"""

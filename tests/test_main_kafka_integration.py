@@ -146,18 +146,30 @@ class TestSocketIOEvents:
 
         sid = str(uuid.uuid4())
         room_id = f"test_room_{uuid.uuid4()}"
-        data = {"room_id": room_id}
+        data = {"room_id": room_id, "password": "test-password-123"}
 
-        # Mock the room_manager.create_room to avoid Redis connection issues
-        with patch.object(
+        # Mock room auth and room creation to avoid Redis dependency
+        with patch("app.main.REDIS_AVAILABLE", True), patch.object(
+            room_manager,
+            "verify_room_password",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch.object(
             room_manager, "create_room", new_callable=AsyncMock
-        ), patch.object(sio, "save_session", new_callable=AsyncMock), patch.object(
+        ), patch.object(
+            sio, "save_session", new_callable=AsyncMock
+        ), patch.object(
             sio, "enter_room"
+        ), patch.object(
+            sio, "emit", new_callable=AsyncMock
         ):
             # Call join_room directly
             await join_room(sid, data)
             # Verify room_manager.create_room was called
             room_manager.create_room.assert_called_once_with(room_id)  # type: ignore[misc]
+            room_manager.verify_room_password.assert_called_once_with(  # type: ignore[misc]
+                room_id, "test-password-123"
+            )
 
 
 class TestKafkaIntegration:
@@ -282,19 +294,17 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_join_room_with_missing_room_id(self):
         """Test join_room event with missing room_id"""
+        from app.main import join_room
+
         sid = str(uuid.uuid4())
         data = {}  # Missing room_id
 
-        with patch.object(sio, "get_session"), patch.object(
-            sio, "save_session", new_callable=AsyncMock
-        ), patch.object(sio, "enter_room"):
-
-            # Should handle gracefully
-            try:
-                room_id = data.get("room_id")
-                assert room_id is None  # nosec
-            except Exception:
-                pass
+        with patch.object(sio, "save_session", new_callable=AsyncMock), patch.object(
+            sio, "enter_room"
+        ), patch.object(sio, "emit", new_callable=AsyncMock) as emit_mock:
+            await join_room(sid, data)
+            emit_mock.assert_called_once()
+            assert emit_mock.call_args.args[0] == "auth_error"  # nosec
 
     @pytest.mark.asyncio
     async def test_post_message_with_empty_content(self):
