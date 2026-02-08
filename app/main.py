@@ -10,9 +10,22 @@ import socketio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer  # type: ignore
 from aiokafka.errors import KafkaConnectionError, KafkaError  # type: ignore
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from app.api.routes import router
+from app.observability import (
+    get_trace_context,
+    metrics_payload,
+    setup_tracing,
+    socket_connections_active,
+    socket_duplicate_completed_dropped_total,
+    socket_join_auth_failures_total,
+    socket_kafka_processing_errors_total,
+    socket_post_publish_failures_total,
+    socket_posts_published_total,
+    socket_worker_events_forwarded_total,
+)
 from app.sockets.manager import RoomManager
 
 
@@ -107,6 +120,7 @@ def _should_drop_duplicate_completed(job_id: str, event_type: str | None) -> boo
     if event_type != "completed":
         return False
     if job_id in _completed_forward_guard:
+        socket_duplicate_completed_dropped_total.inc()
         print(f"[SocketHub] Dropped duplicate completed event for job {job_id}")
         return True
     _completed_forward_guard[job_id] = now
@@ -134,6 +148,9 @@ async def _cleanup_room_queue(result: dict) -> None:
 async def _emit_worker_result(result: dict, target_room: str) -> None:
     job_id = result["job_id"]
     event_type = result.get("event_type")
+    socket_worker_events_forwarded_total.labels(
+        event_type=(event_type or "legacy")
+    ).inc()
     await sio.emit("worker_update", result, room=target_room)
     print(
         f"[SocketHub] Emitted {event_type or 'legacy'} event for job {job_id} to room {target_room}"
@@ -264,6 +281,7 @@ async def lifespan(_app: FastAPI):
 
 # FastAPI app
 app = FastAPI(title="Socket Hub Service", lifespan=lifespan)
+setup_tracing(app)
 app.include_router(router, prefix="/api")
 asgi_app = socketio.ASGIApp(sio, app)
 
@@ -320,28 +338,33 @@ async def register_room(
 # SOCKET EVENTS
 @sio.event
 async def connect(sid, _):
+    socket_connections_active.inc()
     print(f"Client connected: {sid}")
 
 
 @sio.event
 async def disconnect(sid):
+    socket_connections_active.dec()
     print(f"Client disconnected: {sid}")
 
 
 @sio.event
 async def join_room(sid, data):
     if not isinstance(data, dict):
+        socket_join_auth_failures_total.inc()
         await _emit_auth_error(sid, "Invalid join payload.", code="bad_request")
         return
 
     room_id = _normalize_room_id(data.get("room_id"))
     password = str(data.get("password") or "")
     if not room_id or not password:
+        socket_join_auth_failures_total.inc()
         await _emit_auth_error(
             sid, "room_id and password are required to join a room.", code="bad_request"
         )
         return
     if not REDIS_AVAILABLE:
+        socket_join_auth_failures_total.inc()
         await _emit_auth_error(
             sid,
             "Room authentication is temporarily unavailable.",
@@ -352,6 +375,7 @@ async def join_room(sid, data):
     try:
         is_valid = await room_manager.verify_room_password(room_id, password)
     except Exception as e:
+        socket_join_auth_failures_total.inc()
         print(f"[Socket] Room auth check failed: {e}")
         await _emit_auth_error(
             sid, "Room authentication failed. Please retry.", code="service_unavailable"
@@ -359,6 +383,7 @@ async def join_room(sid, data):
         return
 
     if not is_valid:
+        socket_join_auth_failures_total.inc()
         await _emit_auth_error(
             sid, "Invalid room credentials.", code="invalid_credentials"
         )
@@ -379,7 +404,7 @@ async def join_room(sid, data):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "redis": REDIS_AVAILABLE, "kafka": KAFKA_AVAILABLE}
 
 
 @app.get("/ready")
@@ -513,10 +538,14 @@ async def _dispatch_post(post_id: str, room_id: str, payload: dict) -> None:
     kafka_success = False
     if producer is not None:
         try:
+            trace_meta = {k: v for k, v in get_trace_context().items() if v}
+            payload["meta"] = {**(payload.get("meta", {}) or {}), **trace_meta}
             await producer.send_and_wait(POSTS_TOPIC, payload)
+            socket_posts_published_total.inc()
             print(f"[Kafka] Published post {post_id} to {POSTS_TOPIC}")
             kafka_success = True
         except (KafkaConnectionError, KafkaError, OSError) as e:
+            socket_post_publish_failures_total.inc()
             print(f"[Kafka] Publish failed: {e}")
     else:
         print("[Kafka] Skipped publish (Kafka disabled)")
@@ -569,24 +598,30 @@ async def worker_results_listener():
 
     print("[SocketHub] Worker results listener started...")
 
-    async for msg in consumer:
-        result = msg.value
-        job_id = result.get("job_id")
-        post_id = result.get("post_id")
-        room_id = result.get("room_id")
-        event_type = result.get("event_type")
+    try:
+        async for msg in consumer:
+            result = msg.value
+            job_id = result.get("job_id")
+            post_id = result.get("post_id")
+            room_id = result.get("room_id")
+            event_type = result.get("event_type")
 
-        if not job_id:
-            continue
+            if not job_id:
+                continue
 
-        # Emit to the room the client originally joined
-        target_room = room_id or post_id
-        if not target_room:
-            print(f"[SocketHub] No room_id or post_id for job {job_id}, skipping emit")
-            continue
-        if _should_drop_duplicate_completed(job_id, event_type):
-            continue
-        await _emit_worker_result(result, target_room)
+            # Emit to the room the client originally joined
+            target_room = room_id or post_id
+            if not target_room:
+                print(
+                    f"[SocketHub] No room_id or post_id for job {job_id}, skipping emit"
+                )
+                continue
+            if _should_drop_duplicate_completed(job_id, event_type):
+                continue
+            await _emit_worker_result(result, target_room)
+    except Exception as e:
+        socket_kafka_processing_errors_total.inc()
+        print(f"[SocketHub] worker_results_listener failed: {e}")
 
 
 # REDIS LOG SUBSCRIPTION -> EMIT TO SOCKET ROOMS
@@ -661,10 +696,18 @@ async def worker_logs_listener():
                 except json.JSONDecodeError:
                     pass  # Skip malformed messages
                 except Exception as e:
+                    socket_kafka_processing_errors_total.inc()
                     print(f"[SocketHub] Error processing log: {e}")
 
     except Exception as e:
+        socket_kafka_processing_errors_total.inc()
         print(f"[SocketHub] Worker logs listener error: {e}")
     finally:
         if redis_log_client:
             await redis_log_client.close()
+
+
+@app.get("/metrics")
+async def metrics():
+    payload, content_type = metrics_payload()
+    return Response(content=payload, media_type=content_type)
