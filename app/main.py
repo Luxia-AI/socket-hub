@@ -11,6 +11,7 @@ SERVICE_ENV = os.getenv("APP_ENV", "prod")
 socket_connections_current = Gauge(
     "socket_connections_current",
     "Current active websocket connections",
+    multiprocess_mode="livesum",
 )
 
 app = FastAPI(title="Luxia Socket Hub", version=SERVICE_VERSION)
