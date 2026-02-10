@@ -13,7 +13,7 @@ SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
 SERVICE_ENV = os.getenv("APP_ENV", "prod")
 GLOBAL_ROOM_PASSWORD = os.getenv("ROOM_PASSWORD", "")
 DISPATCHER_URL = os.getenv("DISPATCHER_URL", "http://127.0.0.1:8001")
-DISPATCH_TIMEOUT_SECONDS = float(os.getenv("DISPATCH_TIMEOUT_SECONDS", "90"))
+DISPATCH_TIMEOUT_SECONDS = float(os.getenv("DISPATCH_TIMEOUT_SECONDS", "180"))
 
 socket_connections_current = Gauge(
     "socket_connections_current",
@@ -89,13 +89,15 @@ async def _dispatch_and_emit_result(room_id: str, job_id: str, claim: str) -> No
         await sio.emit("worker_update", result, room=room_id)
     except Exception as exc:
         socket_posts_failed_total.inc()
+        error_type = type(exc).__name__
+        error_repr = repr(exc)
         await sio.emit(
             "worker_update",
             {
                 "status": "error",
                 "job_id": job_id,
                 "claim": claim,
-                "message": f"Dispatch pipeline failed: {exc}",
+                "message": f"Dispatch pipeline failed ({error_type}): {error_repr}",
             },
             room=room_id,
         )
