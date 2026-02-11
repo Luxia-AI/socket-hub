@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import uuid
 
@@ -14,6 +15,19 @@ SERVICE_ENV = os.getenv("APP_ENV", "prod")
 GLOBAL_ROOM_PASSWORD = os.getenv("ROOM_PASSWORD", "")
 DISPATCHER_URL = os.getenv("DISPATCHER_URL", "http://127.0.0.1:8001")
 DISPATCH_TIMEOUT_SECONDS = float(os.getenv("DISPATCH_TIMEOUT_SECONDS", "180"))
+DISPATCH_TIMEOUT_MIN_SECONDS = float(os.getenv("DISPATCH_TIMEOUT_MIN_SECONDS", "420"))
+DISPATCH_CONNECT_TIMEOUT_SECONDS = float(
+    os.getenv("DISPATCH_CONNECT_TIMEOUT_SECONDS", "10")
+)
+DISPATCH_WRITE_TIMEOUT_SECONDS = float(
+    os.getenv("DISPATCH_WRITE_TIMEOUT_SECONDS", "30")
+)
+DISPATCH_POOL_TIMEOUT_SECONDS = float(os.getenv("DISPATCH_POOL_TIMEOUT_SECONDS", "30"))
+DISPATCH_READ_TIMEOUT_SECONDS = max(
+    DISPATCH_TIMEOUT_SECONDS, DISPATCH_TIMEOUT_MIN_SECONDS
+)
+
+logger = logging.getLogger(__name__)
 
 socket_connections_current = Gauge(
     "socket_connections_current",
@@ -46,6 +60,14 @@ app = FastAPI(title="Luxia Socket Hub", version=SERVICE_VERSION)
 install_metrics(
     app, service_name=SERVICE_NAME, version=SERVICE_VERSION, env=SERVICE_ENV
 )
+logger.info(
+    "[SocketHub] timeouts read=%.1fs(min=%.1fs) connect=%.1fs write=%.1fs pool=%.1fs",
+    DISPATCH_READ_TIMEOUT_SECONDS,
+    DISPATCH_TIMEOUT_MIN_SECONDS,
+    DISPATCH_CONNECT_TIMEOUT_SECONDS,
+    DISPATCH_WRITE_TIMEOUT_SECONDS,
+    DISPATCH_POOL_TIMEOUT_SECONDS,
+)
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 asgi_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="socket.io")
 _background_tasks: set[asyncio.Task] = set()
@@ -65,9 +87,13 @@ def _is_room_auth_valid(password: str) -> bool:
 async def _dispatch_and_emit_result(room_id: str, job_id: str, claim: str) -> None:
     try:
         with socket_dispatch_duration_seconds.time():
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(DISPATCH_TIMEOUT_SECONDS)
-            ) as client:
+            timeout = httpx.Timeout(
+                connect=DISPATCH_CONNECT_TIMEOUT_SECONDS,
+                read=DISPATCH_READ_TIMEOUT_SECONDS,
+                write=DISPATCH_WRITE_TIMEOUT_SECONDS,
+                pool=DISPATCH_POOL_TIMEOUT_SECONDS,
+            )
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
                     f"{DISPATCHER_URL}/dispatch/submit",
                     json={
