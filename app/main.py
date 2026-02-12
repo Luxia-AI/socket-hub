@@ -1,13 +1,19 @@
 import asyncio
+import contextlib
+import json
 import logging
 import os
+import ssl
 import uuid
 
 import httpx
 import socketio
+from aiokafka import AIOKafkaProducer
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from prometheus_client import Counter, Gauge, Histogram
 from shared.metrics import install_metrics
+
+from app.sockets.manager import RoomManager
 
 SERVICE_NAME = "socket-hub"
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
@@ -26,6 +32,23 @@ DISPATCH_POOL_TIMEOUT_SECONDS = float(os.getenv("DISPATCH_POOL_TIMEOUT_SECONDS",
 DISPATCH_READ_TIMEOUT_SECONDS = max(
     DISPATCH_TIMEOUT_SECONDS, DISPATCH_TIMEOUT_MIN_SECONDS
 )
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+USE_REDIS_ROOMS = os.getenv("SOCKETHUB_USE_REDIS", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+USE_KAFKA_PUBLISH = os.getenv(
+    "SOCKETHUB_USE_KAFKA", os.getenv("ENABLE_KAFKA", "true")
+).strip().lower() in {"1", "true", "yes", "on"}
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+KAFKA_SASL_MECHANISM = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
+KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
+KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
+POSTS_TOPIC = os.getenv("POSTS_TOPIC", "posts.inbound")
+RESULTS_TOPIC = os.getenv("RESULTS_TOPIC", "luxia.results")
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +94,23 @@ logger.info(
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 asgi_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="socket.io")
 _background_tasks: set[asyncio.Task] = set()
+_room_manager: RoomManager | None = None
+_kafka_producer: AIOKafkaProducer | None = None
+
+
+def _kafka_producer_kwargs() -> dict:
+    cfg: dict = {"bootstrap_servers": KAFKA_BOOTSTRAP}
+    if KAFKA_SECURITY_PROTOCOL.upper() == "SASL_SSL":
+        cfg.update(
+            {
+                "security_protocol": "SASL_SSL",
+                "sasl_mechanism": KAFKA_SASL_MECHANISM,
+                "sasl_plain_username": KAFKA_SASL_USERNAME,
+                "sasl_plain_password": KAFKA_SASL_PASSWORD,
+                "ssl_context": ssl.create_default_context(),
+            }
+        )
+    return cfg
 
 
 def _track_background_task(task: asyncio.Task) -> None:
@@ -108,6 +148,16 @@ async def _dispatch_and_emit_result(room_id: str, job_id: str, claim: str) -> No
 
         result = payload.get("result", payload)
         final_status = str(result.get("status", "completed"))
+        if _kafka_producer is not None:
+            try:
+                await _kafka_producer.send_and_wait(
+                    RESULTS_TOPIC,
+                    json.dumps(
+                        {"job_id": job_id, "room_id": room_id, "status": final_status}
+                    ).encode("utf-8"),
+                )
+            except Exception as kafka_exc:
+                logger.warning("[SocketHub] Kafka result publish failed: %s", kafka_exc)
         if final_status == "completed":
             socket_posts_completed_total.inc()
         else:
@@ -159,6 +209,13 @@ async def join_room(sid, data):
 
     await sio.save_session(sid, {"room_id": room_id, "room_authenticated": True})
     await sio.enter_room(sid, room_id)
+    if _room_manager is not None:
+        try:
+            await _room_manager.create_room(room_id)
+        except Exception as redis_exc:
+            logger.warning(
+                "[SocketHub] Redis room create failed for %s: %s", room_id, redis_exc
+            )
     await sio.emit("join_room_success", {"room_id": room_id}, room=sid)
 
 
@@ -192,6 +249,30 @@ async def post_message(sid, data):
 
     socket_posts_received_total.inc()
     job_id = str(uuid.uuid4())
+    if _room_manager is not None:
+        try:
+            await _room_manager.enqueue_post(
+                room_id, {"job_id": job_id, "content": content}
+            )
+        except Exception as redis_exc:
+            logger.warning(
+                "[SocketHub] Redis enqueue failed for %s: %s", room_id, redis_exc
+            )
+    if _kafka_producer is not None:
+        try:
+            await _kafka_producer.send_and_wait(
+                POSTS_TOPIC,
+                json.dumps(
+                    {
+                        "job_id": job_id,
+                        "room_id": room_id,
+                        "claim": content,
+                        "source": SERVICE_NAME,
+                    }
+                ).encode("utf-8"),
+            )
+        except Exception as kafka_exc:
+            logger.warning("[SocketHub] Kafka post publish failed: %s", kafka_exc)
     await sio.emit(
         "worker_update",
         {"status": "processing", "job_id": job_id, "claim": content},
@@ -230,3 +311,46 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 @app.get("/")
 async def root() -> dict[str, str]:
     return {"service": SERVICE_NAME, "status": "running"}
+
+
+@app.on_event("startup")
+async def startup_resources() -> None:
+    global _room_manager, _kafka_producer
+    if USE_REDIS_ROOMS:
+        try:
+            _room_manager = RoomManager(redis_url=REDIS_URL)
+            await _room_manager.connect()
+            logger.info("[SocketHub] Redis room manager enabled")
+        except Exception as exc:
+            _room_manager = None
+            logger.warning(
+                "[SocketHub] Redis unavailable, continuing without room queue: %s", exc
+            )
+    if USE_KAFKA_PUBLISH:
+        try:
+            _kafka_producer = AIOKafkaProducer(**_kafka_producer_kwargs())
+            await _kafka_producer.start()
+            logger.info(
+                "[SocketHub] Kafka producer enabled bootstrap=%s protocol=%s",
+                KAFKA_BOOTSTRAP,
+                KAFKA_SECURITY_PROTOCOL,
+            )
+        except Exception as exc:
+            _kafka_producer = None
+            logger.warning(
+                "[SocketHub] Kafka unavailable, continuing without publish mirror: %s",
+                exc,
+            )
+
+
+@app.on_event("shutdown")
+async def shutdown_resources() -> None:
+    global _room_manager, _kafka_producer
+    if _kafka_producer is not None:
+        with contextlib.suppress(Exception):
+            await _kafka_producer.stop()
+        _kafka_producer = None
+    if _room_manager is not None:
+        with contextlib.suppress(Exception):
+            await _room_manager.disconnect()
+        _room_manager = None
