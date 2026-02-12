@@ -214,7 +214,20 @@ async def _consume_results_loop() -> None:
             room_id = str(payload.get("room_id") or "").strip()
             if not room_id:
                 continue
+            logger.info(
+                "[SocketHub][Kafka] consumed ok topic=%s room_id=%s job_id=%s status=%s",
+                RESULTS_TOPIC,
+                room_id,
+                str(payload.get("job_id") or ""),
+                str(payload.get("status") or ""),
+            )
             await sio.emit("worker_update", payload, room=room_id)
+            logger.info(
+                "[SocketHub][Kafka] result emitted ok room_id=%s job_id=%s status=%s",
+                room_id,
+                str(payload.get("job_id") or ""),
+                str(payload.get("status") or ""),
+            )
             status = str(payload.get("status", "")).lower()
             if status == "completed":
                 socket_posts_completed_total.inc()
@@ -318,6 +331,12 @@ async def post_message(sid, data):
                 ).encode("utf-8"),
             )
             published_to_kafka = True
+            logger.info(
+                "[SocketHub][Kafka] publish ok topic=%s room_id=%s job_id=%s",
+                POSTS_TOPIC,
+                room_id,
+                job_id,
+            )
         except Exception as kafka_exc:
             logger.warning("[SocketHub] Kafka post publish failed: %s", kafka_exc)
     await sio.emit(
