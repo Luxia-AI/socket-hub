@@ -8,7 +8,7 @@ import uuid
 
 import httpx
 import socketio
-from aiokafka import AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from prometheus_client import Counter, Gauge, Histogram
 from shared.metrics import install_metrics
@@ -42,13 +42,17 @@ USE_REDIS_ROOMS = os.getenv("SOCKETHUB_USE_REDIS", "true").strip().lower() in {
 USE_KAFKA_PUBLISH = os.getenv(
     "SOCKETHUB_USE_KAFKA", os.getenv("ENABLE_KAFKA", "true")
 ).strip().lower() in {"1", "true", "yes", "on"}
+USE_KAFKA_RESULTS_CONSUMER = os.getenv(
+    "SOCKETHUB_USE_KAFKA_RESULTS", os.getenv("SOCKETHUB_USE_KAFKA", "true")
+).strip().lower() in {"1", "true", "yes", "on"}
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
 KAFKA_SASL_MECHANISM = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
 KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
 KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
 POSTS_TOPIC = os.getenv("POSTS_TOPIC", "posts.inbound")
-RESULTS_TOPIC = os.getenv("RESULTS_TOPIC", "luxia.results")
+RESULTS_TOPIC = os.getenv("RESULTS_TOPIC", "jobs.results")
+KAFKA_RESULTS_GROUP = os.getenv("SOCKETHUB_RESULTS_GROUP", "socket-hub-results")
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +100,8 @@ asgi_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="socket.io")
 _background_tasks: set[asyncio.Task] = set()
 _room_manager: RoomManager | None = None
 _kafka_producer: AIOKafkaProducer | None = None
+_kafka_consumer: AIOKafkaConsumer | None = None
+_kafka_results_task: asyncio.Task | None = None
 
 
 def _kafka_producer_kwargs() -> dict:
@@ -110,6 +116,18 @@ def _kafka_producer_kwargs() -> dict:
                 "ssl_context": ssl.create_default_context(),
             }
         )
+    return cfg
+
+
+def _kafka_consumer_kwargs() -> dict:
+    cfg = _kafka_producer_kwargs()
+    cfg.update(
+        {
+            "group_id": KAFKA_RESULTS_GROUP,
+            "enable_auto_commit": True,
+            "auto_offset_reset": "latest",
+        }
+    )
     return cfg
 
 
@@ -177,6 +195,33 @@ async def _dispatch_and_emit_result(room_id: str, job_id: str, claim: str) -> No
             },
             room=room_id,
         )
+
+
+async def _consume_results_loop() -> None:
+    if _kafka_consumer is None:
+        logger.warning(
+            "[SocketHub] Kafka results consumer loop started without consumer instance"
+        )
+        return
+    logger.info(
+        "[SocketHub] Kafka results consumer started topic=%s group=%s",
+        RESULTS_TOPIC,
+        KAFKA_RESULTS_GROUP,
+    )
+    async for msg in _kafka_consumer:
+        try:
+            payload = json.loads(msg.value.decode("utf-8"))
+            room_id = str(payload.get("room_id") or "").strip()
+            if not room_id:
+                continue
+            await sio.emit("worker_update", payload, room=room_id)
+            status = str(payload.get("status", "")).lower()
+            if status == "completed":
+                socket_posts_completed_total.inc()
+            elif status in {"error", "failed"}:
+                socket_posts_failed_total.inc()
+        except Exception as exc:
+            logger.warning("[SocketHub] Kafka result consume failed: %s", exc)
 
 
 @sio.event
@@ -258,6 +303,7 @@ async def post_message(sid, data):
             logger.warning(
                 "[SocketHub] Redis enqueue failed for %s: %s", room_id, redis_exc
             )
+    published_to_kafka = False
     if _kafka_producer is not None:
         try:
             await _kafka_producer.send_and_wait(
@@ -271,6 +317,7 @@ async def post_message(sid, data):
                     }
                 ).encode("utf-8"),
             )
+            published_to_kafka = True
         except Exception as kafka_exc:
             logger.warning("[SocketHub] Kafka post publish failed: %s", kafka_exc)
     await sio.emit(
@@ -278,10 +325,11 @@ async def post_message(sid, data):
         {"status": "processing", "job_id": job_id, "claim": content},
         room=room_id,
     )
-    task = asyncio.create_task(
-        _dispatch_and_emit_result(room_id=room_id, job_id=job_id, claim=content)
-    )
-    _track_background_task(task)
+    if not published_to_kafka:
+        task = asyncio.create_task(
+            _dispatch_and_emit_result(room_id=room_id, job_id=job_id, claim=content)
+        )
+        _track_background_task(task)
 
 
 @app.get("/healthz")
@@ -315,7 +363,7 @@ async def root() -> dict[str, str]:
 
 @app.on_event("startup")
 async def startup_resources() -> None:
-    global _room_manager, _kafka_producer
+    global _room_manager, _kafka_producer, _kafka_consumer, _kafka_results_task
     if USE_REDIS_ROOMS:
         try:
             _room_manager = RoomManager(redis_url=REDIS_URL)
@@ -341,11 +389,31 @@ async def startup_resources() -> None:
                 "[SocketHub] Kafka unavailable, continuing without publish mirror: %s",
                 exc,
             )
+    if USE_KAFKA_RESULTS_CONSUMER:
+        try:
+            _kafka_consumer = AIOKafkaConsumer(
+                RESULTS_TOPIC, **_kafka_consumer_kwargs()
+            )
+            await _kafka_consumer.start()
+            _kafka_results_task = asyncio.create_task(_consume_results_loop())
+        except Exception as exc:
+            _kafka_consumer = None
+            _kafka_results_task = None
+            logger.warning("[SocketHub] Kafka results consumer unavailable: %s", exc)
 
 
 @app.on_event("shutdown")
 async def shutdown_resources() -> None:
-    global _room_manager, _kafka_producer
+    global _room_manager, _kafka_producer, _kafka_consumer, _kafka_results_task
+    if _kafka_results_task is not None:
+        _kafka_results_task.cancel()
+        with contextlib.suppress(Exception):
+            await _kafka_results_task
+        _kafka_results_task = None
+    if _kafka_consumer is not None:
+        with contextlib.suppress(Exception):
+            await _kafka_consumer.stop()
+        _kafka_consumer = None
     if _kafka_producer is not None:
         with contextlib.suppress(Exception):
             await _kafka_producer.stop()
