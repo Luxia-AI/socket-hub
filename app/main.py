@@ -118,7 +118,6 @@ def _kafka_producer_kwargs() -> dict:
         "bootstrap_servers": KAFKA_BOOTSTRAP,
         "request_timeout_ms": KAFKA_REQUEST_TIMEOUT_MS,
         "retry_backoff_ms": KAFKA_RETRY_BACKOFF_MS,
-        "retries": KAFKA_RETRIES,
         "connections_max_idle_ms": KAFKA_CONNECTIONS_MAX_IDLE_MS,
     }
     if KAFKA_SECURITY_PROTOCOL.upper() == "SASL_SSL":
@@ -136,8 +135,6 @@ def _kafka_producer_kwargs() -> dict:
 
 def _kafka_consumer_kwargs() -> dict:
     cfg = _kafka_producer_kwargs()
-    # Producer-only option; AIOKafkaConsumer rejects it.
-    cfg.pop("retries", None)
     cfg.update(
         {
             "group_id": KAFKA_RESULTS_GROUP,
