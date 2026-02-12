@@ -9,7 +9,7 @@ import uuid
 import httpx
 import socketio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from prometheus_client import Counter, Gauge, Histogram
 from shared.metrics import install_metrics
 
@@ -50,9 +50,18 @@ KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
 KAFKA_SASL_MECHANISM = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
 KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
 KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
+KAFKA_REQUEST_TIMEOUT_MS = int(os.getenv("KAFKA_REQUEST_TIMEOUT_MS", "90000"))
+KAFKA_RETRY_BACKOFF_MS = int(os.getenv("KAFKA_RETRY_BACKOFF_MS", "1000"))
+KAFKA_RETRIES = int(os.getenv("KAFKA_RETRIES", "8"))
+KAFKA_CONNECTIONS_MAX_IDLE_MS = int(
+    os.getenv("KAFKA_CONNECTIONS_MAX_IDLE_MS", "180000")
+)
 POSTS_TOPIC = os.getenv("POSTS_TOPIC", "posts.inbound")
 RESULTS_TOPIC = os.getenv("RESULTS_TOPIC", "jobs.results")
 KAFKA_RESULTS_GROUP = os.getenv("SOCKETHUB_RESULTS_GROUP", "socket-hub-results")
+SOCKETHUB_RESULT_CALLBACK_TOKEN = os.getenv(
+    "SOCKETHUB_RESULT_CALLBACK_TOKEN", ""
+).strip()
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +114,13 @@ _kafka_results_task: asyncio.Task | None = None
 
 
 def _kafka_producer_kwargs() -> dict:
-    cfg: dict = {"bootstrap_servers": KAFKA_BOOTSTRAP}
+    cfg: dict = {
+        "bootstrap_servers": KAFKA_BOOTSTRAP,
+        "request_timeout_ms": KAFKA_REQUEST_TIMEOUT_MS,
+        "retry_backoff_ms": KAFKA_RETRY_BACKOFF_MS,
+        "retries": KAFKA_RETRIES,
+        "connections_max_idle_ms": KAFKA_CONNECTIONS_MAX_IDLE_MS,
+    }
     if KAFKA_SECURITY_PROTOCOL.upper() == "SASL_SSL":
         cfg.update(
             {
@@ -129,6 +144,32 @@ def _kafka_consumer_kwargs() -> dict:
         }
     )
     return cfg
+
+
+def _is_dispatcher_callback_allowed(token: str | None) -> bool:
+    if not SOCKETHUB_RESULT_CALLBACK_TOKEN:
+        return True
+    return bool(token) and token == SOCKETHUB_RESULT_CALLBACK_TOKEN
+
+
+def _log_kafka_runtime_config() -> None:
+    using_event_hubs = "servicebus.windows.net" in KAFKA_BOOTSTRAP.lower()
+    logger.info(
+        "[SocketHub][KafkaConfig] bootstrap=%s protocol=%s request_timeout_ms=%d retries=%d retry_backoff_ms=%d",
+        KAFKA_BOOTSTRAP,
+        KAFKA_SECURITY_PROTOCOL,
+        KAFKA_REQUEST_TIMEOUT_MS,
+        KAFKA_RETRIES,
+        KAFKA_RETRY_BACKOFF_MS,
+    )
+    if using_event_hubs and KAFKA_SECURITY_PROTOCOL.upper() != "SASL_SSL":
+        logger.warning(
+            "[SocketHub][KafkaConfig] Event Hubs bootstrap detected but protocol is not SASL_SSL"
+        )
+    if using_event_hubs and ":9093" not in KAFKA_BOOTSTRAP:
+        logger.warning(
+            "[SocketHub][KafkaConfig] Event Hubs bootstrap should usually include :9093"
+        )
 
 
 def _track_background_task(task: asyncio.Task) -> None:
@@ -380,9 +421,37 @@ async def root() -> dict[str, str]:
     return {"service": SERVICE_NAME, "status": "running"}
 
 
+@app.post("/internal/dispatch-result")
+async def internal_dispatch_result(
+    payload: dict,
+    x_dispatcher_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    if not _is_dispatcher_callback_allowed(x_dispatcher_token):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    room_id = str(payload.get("room_id") or "").strip()
+    if not room_id:
+        return {"status": "ignored"}
+
+    await sio.emit("worker_update", payload, room=room_id)
+    logger.info(
+        "[SocketHub][Fallback] result emitted ok room_id=%s job_id=%s status=%s",
+        room_id,
+        str(payload.get("job_id") or ""),
+        str(payload.get("status") or ""),
+    )
+    status = str(payload.get("status", "")).lower()
+    if status == "completed":
+        socket_posts_completed_total.inc()
+    elif status in {"error", "failed"}:
+        socket_posts_failed_total.inc()
+    return {"status": "ok"}
+
+
 @app.on_event("startup")
 async def startup_resources() -> None:
     global _room_manager, _kafka_producer, _kafka_consumer, _kafka_results_task
+    _log_kafka_runtime_config()
     if USE_REDIS_ROOMS:
         try:
             _room_manager = RoomManager(redis_url=REDIS_URL)
