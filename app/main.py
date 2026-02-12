@@ -136,6 +136,8 @@ def _kafka_producer_kwargs() -> dict:
 
 def _kafka_consumer_kwargs() -> dict:
     cfg = _kafka_producer_kwargs()
+    # Producer-only option; AIOKafkaConsumer rejects it.
+    cfg.pop("retries", None)
     cfg.update(
         {
             "group_id": KAFKA_RESULTS_GROUP,
