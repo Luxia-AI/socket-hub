@@ -217,6 +217,49 @@ async def _authorize_socket_action(
         return False, f"authorization service unavailable: {exc}"
 
 
+async def _verify_room_secret(
+    *,
+    token: str,
+    client_id: str,
+    room_id: str,
+    room_secret: str,
+) -> tuple[bool, str | None]:
+    if not CONTROL_PLANE_URL:
+        return True, None
+    if not token:
+        return False, "access_token is required."
+    if not room_secret:
+        return False, "password is required."
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "client_id": client_id,
+        "room_id": room_id,
+        "room_secret": room_secret,
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3.0, read=6.0, write=3.0, pool=3.0)
+        ) as client:
+            response = await client.post(
+                f"{CONTROL_PLANE_URL}/v1/socket/verify-room-secret",
+                params=params,
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                detail = ""
+                try:
+                    detail = str(response.json().get("detail", ""))
+                except Exception:
+                    detail = response.text
+                return False, detail or "room password verification failed"
+            body = response.json() if response.content else {}
+            if not bool(body.get("authorized")):
+                return False, "invalid room password"
+            return True, None
+    except Exception as exc:
+        return False, f"room password verification service unavailable: {exc}"
+
+
 async def _dispatch_and_emit_result(
     room_id: str,
     job_id: str,
@@ -364,6 +407,23 @@ async def join_room(sid, data):
     if not _is_room_auth_valid(password):
         socket_auth_errors_total.inc()
         await sio.emit("auth_error", {"message": "Invalid room credentials."}, room=sid)
+        return
+    secret_ok, secret_reason = await _verify_room_secret(
+        token=access_token,
+        client_id=client_id,
+        room_id=room_id,
+        room_secret=password,
+    )
+    if not secret_ok:
+        socket_auth_errors_total.inc()
+        await sio.emit(
+            "auth_error",
+            {
+                "message": secret_reason or "Invalid room credentials.",
+                "code": "invalid_room_password",
+            },
+            room=sid,
+        )
         return
     authorized, reason = await _authorize_socket_action(
         token=access_token,
