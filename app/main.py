@@ -62,6 +62,7 @@ KAFKA_RESULTS_GROUP = os.getenv("SOCKETHUB_RESULTS_GROUP", "socket-hub-results")
 SOCKETHUB_RESULT_CALLBACK_TOKEN = os.getenv(
     "SOCKETHUB_RESULT_CALLBACK_TOKEN", ""
 ).strip()
+CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "").strip().rstrip("/")
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +183,47 @@ def _is_room_auth_valid(password: str) -> bool:
     return True
 
 
-async def _dispatch_and_emit_result(room_id: str, job_id: str, claim: str) -> None:
+async def _authorize_socket_action(
+    *,
+    token: str,
+    client_id: str,
+    room_id: str,
+    action: str,
+) -> tuple[bool, str | None]:
+    if not CONTROL_PLANE_URL:
+        return True, None
+    if not token:
+        return False, "access_token is required."
+    payload = {"client_id": client_id, "room_id": room_id, "action": action}
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3.0, read=6.0, write=3.0, pool=3.0)
+        ) as client:
+            response = await client.post(
+                f"{CONTROL_PLANE_URL}/v1/socket/authorize",
+                json=payload,
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                detail = ""
+                try:
+                    detail = str(response.json().get("detail", ""))
+                except Exception:
+                    detail = response.text
+                return False, detail or "authorization failed"
+            return True, None
+    except Exception as exc:
+        return False, f"authorization service unavailable: {exc}"
+
+
+async def _dispatch_and_emit_result(
+    room_id: str,
+    job_id: str,
+    claim: str,
+    client_id: str | None = None,
+    client_claim_id: str | None = None,
+) -> None:
     try:
         with socket_dispatch_duration_seconds.time():
             timeout = httpx.Timeout(
@@ -198,6 +239,8 @@ async def _dispatch_and_emit_result(room_id: str, job_id: str, claim: str) -> No
                         "job_id": job_id,
                         "claim": claim,
                         "room_id": room_id,
+                        "client_id": client_id,
+                        "client_claim_id": client_claim_id,
                         "source": SERVICE_NAME,
                     },
                 )
@@ -211,7 +254,13 @@ async def _dispatch_and_emit_result(room_id: str, job_id: str, claim: str) -> No
                 await _kafka_producer.send_and_wait(
                     RESULTS_TOPIC,
                     json.dumps(
-                        {"job_id": job_id, "room_id": room_id, "status": final_status}
+                        {
+                            "job_id": job_id,
+                            "room_id": room_id,
+                            "client_id": client_id,
+                            "client_claim_id": client_claim_id,
+                            "status": final_status,
+                        }
                     ).encode("utf-8"),
                 )
             except Exception as kafka_exc:
@@ -231,6 +280,8 @@ async def _dispatch_and_emit_result(room_id: str, job_id: str, claim: str) -> No
                 "status": "error",
                 "job_id": job_id,
                 "claim": claim,
+                "client_id": client_id,
+                "client_claim_id": client_claim_id,
                 "message": f"Dispatch pipeline failed ({error_type}): {error_repr}",
             },
             room=room_id,
@@ -296,16 +347,48 @@ async def join_room(sid, data):
 
     room_id = str(data.get("room_id") or "").strip()
     password = str(data.get("password") or "")
+    client_id = str(data.get("client_id") or "").strip()
+    access_token = str(data.get("access_token") or "")
     if not room_id:
         socket_auth_errors_total.inc()
         await sio.emit("auth_error", {"message": "room_id is required."}, room=sid)
+        return
+    if not client_id:
+        socket_auth_errors_total.inc()
+        await sio.emit(
+            "auth_error",
+            {"message": "client_id is required.", "code": "missing_client_id"},
+            room=sid,
+        )
         return
     if not _is_room_auth_valid(password):
         socket_auth_errors_total.inc()
         await sio.emit("auth_error", {"message": "Invalid room credentials."}, room=sid)
         return
+    authorized, reason = await _authorize_socket_action(
+        token=access_token,
+        client_id=client_id,
+        room_id=room_id,
+        action="join",
+    )
+    if not authorized:
+        socket_auth_errors_total.inc()
+        await sio.emit(
+            "auth_error",
+            {"message": reason or "Unauthorized", "code": "authorization_failed"},
+            room=sid,
+        )
+        return
 
-    await sio.save_session(sid, {"room_id": room_id, "room_authenticated": True})
+    await sio.save_session(
+        sid,
+        {
+            "room_id": room_id,
+            "client_id": client_id,
+            "access_token": access_token,
+            "room_authenticated": True,
+        },
+    )
     await sio.enter_room(sid, room_id)
     if _room_manager is not None:
         try:
@@ -314,7 +397,9 @@ async def join_room(sid, data):
             logger.warning(
                 "[SocketHub] Redis room create failed for %s: %s", room_id, redis_exc
             )
-    await sio.emit("join_room_success", {"room_id": room_id}, room=sid)
+    await sio.emit(
+        "join_room_success", {"room_id": room_id, "client_id": client_id}, room=sid
+    )
 
 
 @sio.event
@@ -329,12 +414,29 @@ async def post_message(sid, data):
 
     session = await sio.get_session(sid)
     room_id = str(data.get("room_id") or session.get("room_id") or "").strip()
-    content = str(data.get("content") or "").strip()
+    client_id = str(data.get("client_id") or session.get("client_id") or "").strip()
+    access_token = str(data.get("access_token") or session.get("access_token") or "")
+    content = str(data.get("content") or data.get("claim") or "").strip()
+    client_claim_id = str(data.get("client_claim_id") or "").strip()
 
     if not session.get("room_authenticated") or not room_id:
         socket_auth_errors_total.inc()
         await sio.emit(
             "auth_error", {"message": "You must join a room first."}, room=sid
+        )
+        return
+    authorized, reason = await _authorize_socket_action(
+        token=access_token,
+        client_id=client_id,
+        room_id=room_id,
+        action="post",
+    )
+    if not authorized:
+        socket_auth_errors_total.inc()
+        await sio.emit(
+            "auth_error",
+            {"message": reason or "Unauthorized", "code": "authorization_failed"},
+            room=sid,
         )
         return
     if not content:
@@ -365,6 +467,8 @@ async def post_message(sid, data):
                     {
                         "job_id": job_id,
                         "room_id": room_id,
+                        "client_id": client_id,
+                        "client_claim_id": client_claim_id,
                         "claim": content,
                         "source": SERVICE_NAME,
                     }
@@ -381,12 +485,24 @@ async def post_message(sid, data):
             logger.warning("[SocketHub] Kafka post publish failed: %s", kafka_exc)
     await sio.emit(
         "worker_update",
-        {"status": "processing", "job_id": job_id, "claim": content},
+        {
+            "status": "processing",
+            "job_id": job_id,
+            "client_id": client_id,
+            "client_claim_id": client_claim_id,
+            "claim": content,
+        },
         room=room_id,
     )
     if not published_to_kafka:
         task = asyncio.create_task(
-            _dispatch_and_emit_result(room_id=room_id, job_id=job_id, claim=content)
+            _dispatch_and_emit_result(
+                room_id=room_id,
+                job_id=job_id,
+                claim=content,
+                client_id=client_id,
+                client_claim_id=client_claim_id or None,
+            )
         )
         _track_background_task(task)
 
