@@ -404,6 +404,14 @@ async def join_room(sid, data):
             room=sid,
         )
         return
+    if not password:
+        socket_auth_errors_total.inc()
+        await sio.emit(
+            "auth_error",
+            {"message": "password is required.", "code": "invalid_room_password"},
+            room=sid,
+        )
+        return
     if not _is_room_auth_valid(password):
         socket_auth_errors_total.inc()
         await sio.emit("auth_error", {"message": "Invalid room credentials."}, room=sid)
