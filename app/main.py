@@ -177,6 +177,25 @@ def _track_background_task(task: asyncio.Task) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
+async def _emit_worker_stage(payload: dict) -> None:
+    room_id = str(payload.get("room_id") or "").strip()
+    if not room_id:
+        return
+    stage = str(payload.get("stage") or "").strip() or "stage_update"
+    stage_event = {
+        "job_id": payload.get("job_id"),
+        "room_id": room_id,
+        "client_id": payload.get("client_id"),
+        "client_claim_id": payload.get("client_claim_id"),
+        "claim": payload.get("claim"),
+        "stage": stage,
+        "stage_payload": payload.get("stage_payload") or payload.get("payload") or {},
+        "timestamp": payload.get("timestamp"),
+        "source": payload.get("source") or "worker",
+    }
+    await sio.emit("worker_stage", stage_event, room=room_id)
+
+
 def _is_room_auth_valid(password: str) -> bool:
     if GLOBAL_ROOM_PASSWORD:
         return password == GLOBAL_ROOM_PASSWORD
@@ -628,6 +647,28 @@ async def internal_dispatch_result(
         socket_posts_completed_total.inc()
     elif status in {"error", "failed"}:
         socket_posts_failed_total.inc()
+    return {"status": "ok"}
+
+
+@app.post("/internal/dispatch-stage")
+async def internal_dispatch_stage(
+    payload: dict,
+    x_dispatcher_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    if not _is_dispatcher_callback_allowed(x_dispatcher_token):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    room_id = str(payload.get("room_id") or "").strip()
+    if not room_id:
+        return {"status": "ignored"}
+
+    await _emit_worker_stage(payload)
+    logger.info(
+        "[SocketHub][Stage] emitted room_id=%s job_id=%s stage=%s",
+        room_id,
+        str(payload.get("job_id") or ""),
+        str(payload.get("stage") or ""),
+    )
     return {"status": "ok"}
 
 
