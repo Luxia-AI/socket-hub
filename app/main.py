@@ -361,33 +361,37 @@ async def _consume_results_loop() -> None:
         RESULTS_TOPIC,
         KAFKA_RESULTS_GROUP,
     )
-    async for msg in _kafka_consumer:
-        try:
-            payload = json.loads(msg.value.decode("utf-8"))
-            room_id = str(payload.get("room_id") or "").strip()
-            if not room_id:
-                continue
-            logger.info(
-                "[SocketHub][Kafka] consumed ok topic=%s room_id=%s job_id=%s status=%s",
-                RESULTS_TOPIC,
-                room_id,
-                str(payload.get("job_id") or ""),
-                str(payload.get("status") or ""),
-            )
-            await sio.emit("worker_update", payload, room=room_id)
-            logger.info(
-                "[SocketHub][Kafka] result emitted ok room_id=%s job_id=%s status=%s",
-                room_id,
-                str(payload.get("job_id") or ""),
-                str(payload.get("status") or ""),
-            )
-            status = str(payload.get("status", "")).lower()
-            if status == "completed":
-                socket_posts_completed_total.inc()
-            elif status in {"error", "failed"}:
-                socket_posts_failed_total.inc()
-        except Exception as exc:
-            logger.warning("[SocketHub] Kafka result consume failed: %s", exc)
+    try:
+        async for msg in _kafka_consumer:
+            try:
+                payload = json.loads(msg.value.decode("utf-8"))
+                room_id = str(payload.get("room_id") or "").strip()
+                if not room_id:
+                    continue
+                logger.info(
+                    "[SocketHub][Kafka] consumed ok topic=%s room_id=%s job_id=%s status=%s",
+                    RESULTS_TOPIC,
+                    room_id,
+                    str(payload.get("job_id") or ""),
+                    str(payload.get("status") or ""),
+                )
+                await sio.emit("worker_update", payload, room=room_id)
+                logger.info(
+                    "[SocketHub][Kafka] result emitted ok room_id=%s job_id=%s status=%s",
+                    room_id,
+                    str(payload.get("job_id") or ""),
+                    str(payload.get("status") or ""),
+                )
+                status = str(payload.get("status", "")).lower()
+                if status == "completed":
+                    socket_posts_completed_total.inc()
+                elif status in {"error", "failed"}:
+                    socket_posts_failed_total.inc()
+            except Exception as exc:
+                logger.warning("[SocketHub] Kafka result consume failed: %s", exc)
+    except asyncio.CancelledError:
+        logger.info("[SocketHub] Kafka results consumer cancelled during shutdown")
+        raise
 
 
 @sio.event
@@ -719,7 +723,7 @@ async def shutdown_resources() -> None:
     global _room_manager, _kafka_producer, _kafka_consumer, _kafka_results_task
     if _kafka_results_task is not None:
         _kafka_results_task.cancel()
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await _kafka_results_task
         _kafka_results_task = None
     if _kafka_consumer is not None:
